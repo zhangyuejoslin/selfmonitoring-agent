@@ -27,9 +27,9 @@ class PanoBaseAgent(object):
                     'instr_id': k,
                     'trajectory': v['path'],
                     'distance': v['distance'],
-                    'img_attn': v['img_attn'],
-                    'ctx_attn': v['ctx_attn'],
-                    'value': v['value'],
+                    #'img_attn': v['img_attn'],
+                    #'config_attn': v['config_attn'],
+                   # 'value': v['value'],
                     'viewpoint_idx': v['viewpoint_idx'],
                     'navigable_idx': v['navigable_idx']
                 }
@@ -45,16 +45,20 @@ class PanoBaseAgent(object):
         distance = self.env.distances[ob['scan']][ob['viewpoint']][gt['path'][-1]]
         return distance
 
-    def _select_action(self, logit, ended, is_prob=False, fix_action_ended=True):
+    def _select_action(self, logit, ended, target, is_prob=False, fix_action_ended=True):
         logit_cpu = logit.clone().cpu()
+        target_cpu = target.clone().cpu()
         if is_prob:
             probs = logit_cpu
         else:
-            probs = F.softmax(logit_cpu, 1)
+            probs = F.softmax(logit_cpu, 1)     
 
         if self.feedback == 'argmax':
             _, action = probs.max(1)  # student forcing - argmax
             action = action.detach()
+        elif self.feedback == 'teacher': #teacher forcing
+            action = target_cpu.detach()
+
         elif self.feedback == 'sample':
             # sampling an action from model
             m = D.Categorical(probs)
@@ -134,8 +138,16 @@ class PanoBaseAgent(object):
         seq_lengths[seq_lengths == 0] = seq_tensor.shape[1]  # Full length
         seq_tensor = torch.from_numpy(seq_tensor)
         return seq_tensor.long().to(self.device), list(seq_lengths)
-
-
+    
+    def _config_batch(self, obs):
+        """ Extract the configurations and its numbers"""
+        batch_configurations = []
+        configuration_num = []
+        for ob in obs:
+            batch_configurations += ob['configurations']
+            configuration_num.append(len(ob['configurations']))
+        return batch_configurations, configuration_num
+    
 class PanoSeq2SeqAgent(PanoBaseAgent):
     """ An agent based on an LSTM seq2seq model with attention. """
     def __init__(self, opts, env, results_path, encoder, model, feedback='sample', episode_len=20):
@@ -220,7 +232,7 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
                 'length': 0,
                 'feature': [ob['feature']],
                 'img_attn': [],
-                'ctx_attn': [],
+                'config_attn': [],
                 'value': [],
                 'progress_monitor': [],
                 'action_confidence': [],
@@ -242,7 +254,7 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
 
         return traj, scan_id, ended, last_recorded
 
-    def update_traj(self, obs, traj, img_attn, ctx_attn, value, next_viewpoint_idx,
+    def update_traj(self, obs, traj, img_attn, config_attn, value, next_viewpoint_idx,
                     navigable_index, ended, last_recorded, action_prob=None):
         # Save trajectory output and accumulated reward
         for i, ob in enumerate(obs):
@@ -251,7 +263,7 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
                 dist = super(PanoSeq2SeqAgent, self)._get_distance(ob)
                 traj[i]['distance'].append(dist)
                 traj[i]['img_attn'].append(img_attn[i].detach().cpu().numpy().tolist())
-                traj[i]['ctx_attn'].append(ctx_attn[i].detach().cpu().numpy().tolist())
+                traj[i]['config_attn'].append(config_attn[i].detach().cpu().numpy().tolist())
 
                 if len(value[1]) > 1:
                     traj[i]['value'].append(value[i].detach().cpu().tolist())
@@ -345,6 +357,59 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
                 break
 
         self.dist_from_goal = [traj_tmp['distance'][-1] for traj_tmp in traj]
+
+        return loss, traj
+    
+    def rollout_config(self):
+        obs = np.array(self.env.reset()) # load a mini-batch
+        batch_size = len(obs)
+
+        batch_configurations, configuration_num_list = super(PanoSeq2SeqAgent, self)._config_batch(obs)
+
+        # initialize the trajectory
+        traj, scan_id, ended, last_recorded = self.init_traj(obs)
+   
+        # Do a sequence rollout and calculate the loss
+        loss = 0
+        state_attention_0, r0, h0, c0 = self.encoder.init_state(batch_size, max(configuration_num_list))
+        state_atten = state_attention_0
+        h_t = h0
+        c_t = c0
+        for step in range(self.opts.max_episode_len):     
+            pano_img_feat, navigable_feat, \
+            viewpoints_indices = super(PanoSeq2SeqAgent, self).pano_navigable_feat(obs, ended) # should change pano_img_feat and navigable_feat
+            viewpoints, navigable_index, target_index = viewpoints_indices    
+
+            pano_img_feat = pano_img_feat.to(self.device)
+            navigable_feat = navigable_feat.to(self.device)
+            target = torch.LongTensor(target_index).to(self.device)
+             # forward
+            r_t = r0 if step==0 else None
+            config_embedding, padded_mask= self.encoder(batch_configurations, configuration_num_list)
+            h_t, c_t, state_atten, logit, img_attn, navigable_mask = self.model(config_embedding, padded_mask, state_atten, \
+            pano_img_feat, h_t, c_t, state_atten, r_t, navigable_index, navigable_feat)
+     
+            logit.data.masked_fill_((navigable_mask == 0).data, -float('inf'))
+            loss += self.criterion(logit, target)
+          
+            # select action based on prediction
+            action = super(PanoSeq2SeqAgent, self)._select_action(logit, ended, target) 
+
+            next_viewpoints, next_headings, next_viewpoint_idx, ended = super(PanoSeq2SeqAgent, self)._next_viewpoint(
+                obs, viewpoints, navigable_index, action, ended)
+
+            # make a viewpoint change in the env
+            obs = self.env.step(scan_id, next_viewpoints, next_headings)
+
+
+            # save trajectory output and update last_recorded
+            traj, last_recorded = self.update_traj(obs, traj, img_attn, state_atten, c_t, next_viewpoint_idx,
+                                                   navigable_index, ended, last_recorded)
+            
+            if last_recorded.all():
+                break
+
+            # check traj
 
         return loss, traj
 
