@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from models.modules import build_mlp, SoftAttention, PositionalEncoding, ScaledDotProductAttention, create_mask, proj_masking, PositionalEncoding, StateAttention
+from models.modules import build_mlp, SoftAttention, PositionalEncoding, ScaledDotProductAttention, create_mask, create_mask_for_object, proj_masking, PositionalEncoding, StateAttention, ConfigAttention
 
 class SelfMonitoring(nn.Module):
     """ An unrolled LSTM with attention over instructions for decoding navigation actions. """
@@ -257,7 +257,7 @@ class ConfiguringObject(nn.Module):
         self.hidden_size = rnn_hidden_size
 
         proj_navigable_kwargs = {
-            'input_dim': img_feat_input_dim,
+            'input_dim': 2048,
             'hidden_dims': img_fc_dim,
             'use_batchnorm': img_fc_use_batchnorm,
             'dropout': img_dropout,
@@ -271,6 +271,8 @@ class ConfiguringObject(nn.Module):
         self.soft_attn = SoftAttention()
         
         self.state_attention = StateAttention()
+
+        self.config_attention = ConfigAttention()
 
         self.dropout = nn.Dropout(p=rnn_dropout)
         
@@ -286,11 +288,13 @@ class ConfiguringObject(nn.Module):
 
         self.r_linear = nn.Linear(rnn_hidden_size + 128, 2)
 
+        self.config_atten_linear = nn.Linear(768, 128)
+
         self.sm = nn.Softmax(dim=1)
 
 
 
-    def forward(self, config_embedding, padded_mask, state_attention, image_feature, h_0, c_0, s_0, r_t, navigable_index, navigable_feat):
+    def forward(self, config_embedding, padded_mask, state_attention, h_0, c_0, s_0, r_t, navigable_index, obj_navigable_feat):
 
         """ Takes a single step in the decoder LSTM.
         config_embedding: batch x max_config_len x config embeddding
@@ -301,38 +305,35 @@ class ConfiguringObject(nn.Module):
         ctx_mask: batch x seq_len - indices to be masked
         """
         # input of image_feature should be changed
-        image_feature = torch.zeros(4, 12, 36, 2048)
-        navigable_feat = torch.zeros(4, 16, 36, 2048)
 
-        batch_size, num_heading, num_object, object_feat = image_feature.size()
-        navigable_feat_list = []
-
+        batch_size, num_heading, num_object, object_feat_dim = obj_navigable_feat.size()
+        obj_navigable_feat = obj_navigable_feat.view(batch_size, num_heading*num_object, object_feat_dim) #4 x 16*36 x 2048
         index_length = [len(_index)+1 for _index in navigable_index]
-        for each_index in navigable_index:
-            navigable_feat_list.append(image_feature[:,each_index % 12,:,:])
-            
-        navigable_feat = torch.stack(navigable_feat_list, dim=1)
-        navigable_feat = navigable_feat.view(4, 16*36, 2048)
         navigable_mask = create_mask(batch_size, self.max_navigable, index_length)
-        # soft:
-        weighted_navigable_feat = SoftAttention
-        # 4 X 1 x 2048
+        navigable_obj_mask = create_mask_for_object(batch_size, self.max_navigable*num_object, index_length) #batch x 16*36
+        proj_navigable_feat = proj_masking(obj_navigable_feat, self.proj_navigable_mlp, navigable_obj_mask) # batch x 16*36 x 2048 -> batch x 16*36 x 128
 
-        #concat_input = torch.cat((pre_feat, weighted_img_feat), 1)
-        weighted_config_feature, s_1 =  self.state_attention(s_0, r_0, config_embedding, padded_mask)
-        concat_input = weighted_config_feature
-        h_1,c_1 = self.lstm(self.dropout(concat_input), (h_0.squeeze(dim = 0), c_0.squeeze(dim = 0)))
-        h_1_drop = self.drop(h_1)
-        h_1_drop = self.linear(2816, 2048)
-        # 4 x 1 x2048
-        # 4 x 2048 x1
 
-        logit = torch.bmm(navigable_feat, h_1_drop.transpose)
-        # 4 x 16*36 x 1
-        logit = logit.view(4, 16, 36)
-        logit = logit.max(dim=2)
+        weighted_obj_feat, obj_attn = self.soft_attn(self.h0_fc(h_0), proj_navigable_feat, mask=navigable_obj_mask) # batch x 128
 
-        return h_1_drop, c_1, s_1, logit
+        if r_t is None:
+            r_t = self.r_linear(torch.cat((weighted_obj_feat, h_0), dim=1)) 
+            r_t = self.sm(r_t)
+        weighted_config_feature, s_1 = self.state_attention(s_0, r_t, config_embedding, padded_mask) # batch x 768
+        concat_input = torch.cat((weighted_config_feature, weighted_obj_feat), dim=1)
+
+        h_1,c_1 = self.lstm(self.dropout(concat_input), (h_0, c_0))
+        h_1_drop = self.dropout(h_1) # batch x 256
+        h_tilde = self.logit_fc(h_1_drop)# batch x 128
+ 
+        logit = torch.bmm(proj_navigable_feat, h_tilde.unsqueeze(2)).squeeze(2)
+        logit = logit.view(batch_size, num_heading, num_object) # batch x 16 x 36
+        logit = self.config_attention(self.config_atten_linear(weighted_config_feature), proj_navigable_feat, logit)
+
+
+        #logit = logit.max(dim=2)[0] #batch x 16
+
+        return h_1, c_1, s_1, logit, obj_attn, navigable_mask
 
         
         
