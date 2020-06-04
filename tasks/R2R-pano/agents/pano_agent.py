@@ -2,6 +2,7 @@ import json
 import random
 import numpy as np
 import copy
+import math
 
 import torch
 import torch.nn as nn
@@ -18,6 +19,8 @@ class PanoBaseAgent(object):
         self.results_path = results_path
         random.seed(1)
         self.results = {}
+        self.image_feature_path = '/egr/research-hlr/joslin/Matterdata/v1/scans/pretrained_npy/'
+        self.image_cache = {}
     
     def write_results(self):
         output = []
@@ -129,6 +132,68 @@ class PanoBaseAgent(object):
             navigable_feat[i, 1:len(navi_index) + 1] = pano_img_feat[i, navi_index]
 
         return pano_img_feat, navigable_feat, (viewpoints, navigable_feat_index, target_index)
+    
+
+    def obj_navigable_feat(self, obs, ended):
+        
+        object_num = 36
+        feature_size = 2048
+        navigable_feat = torch.zeros(len(obs), self.opts.max_navigable, object_num, feature_size)
+
+        navigable_feat_index, target_index, viewpoints = [], [], []
+        for i, ob in enumerate(obs):
+            index_list = []
+            viewpoints_tmp = []
+            heading_list = []
+            gt_viewpoint_id, viewpoint_idx = ob['gt_viewpoint_idx']
+
+            for j, viewpoint_id in enumerate(ob['navigableLocations']):
+                index_list.append(int(ob['navigableLocations'][viewpoint_id]['index']))
+                viewpoints_tmp.append(viewpoint_id)
+                heading_list.append(ob['navigableLocations'][viewpoint_id]['rel_heading'])
+
+                if viewpoint_id == gt_viewpoint_id:
+                    # if it's already ended, we label the target as <ignore>
+                    if ended[i] and self.opts.use_ignore_index:
+                        target_index.append(self.ignore_index)
+                    else:
+                        target_index.append(j)
+
+            # we ignore the first index because it's the viewpoint index of the current location
+            # not the viewpoint index for one of the navigable directions
+            # we will use 0-vector to represent the image feature that leads to "stay"
+            navi_index = index_list[1:]
+            navigable_feat_index.append(navi_index)
+            viewpoints.append(viewpoints_tmp)
+            heading_list = heading_list[1:]
+
+            navigable_feat[i, 1:len(navi_index) + 1] = self._faster_rcnn_feature(ob, heading_list)
+
+        return navigable_feat, (viewpoints, navigable_feat_index, target_index)
+    
+    def load_image_features(self, scan_id):
+        if len(self.image_cache) > 20:
+            delete_key = random.choice(list(self.image_cache))
+            if delete_key != scan_id:
+                del self.image_cache[delete_key]
+        if scan_id not in self.image_cache:
+            self.image_cache[scan_id] = np.load(self.image_feature_path + scan_id + ".npy", allow_pickle=True)
+        return self.image_cache[scan_id]
+
+    
+    def _faster_rcnn_feature(self, ob, heading_list):
+        features = []
+        all_image_feature = self.load_image_features(ob['scan'])
+        for heading in heading_list:
+            temp = int(round((heading*180/math.pi)/5) * 5)
+            if temp >=  360:
+                temp = temp - 360      
+            elif temp < 0 :
+                temp = temp + 360
+            features.append(torch.from_numpy(all_image_feature.item()[ob['viewpoint']][temp*math.pi/180]['features']))
+        features = torch.stack(features, dim=0)
+
+        return features
 
     def _sort_batch(self, obs):
         """ Extract instructions from a list of observations and sort by descending
@@ -412,6 +477,57 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
             # check traj
 
         return loss, traj
+    
+    def rollout_object_config(self):
+        obs = np.array(self.env.reset()) # load a mini-batch
+        batch_size = len(obs)
+
+        batch_configurations, configuration_num_list = super(PanoSeq2SeqAgent, self)._config_batch(obs)
+
+        # initialize the trajectory
+        traj, scan_id, ended, last_recorded = self.init_traj(obs)
+   
+        # Do a sequence rollout and calculate the loss
+        loss = 0
+        state_attention_0, r0, h0, c0 = self.encoder.init_state(batch_size, max(configuration_num_list))
+        state_atten = state_attention_0
+        h_t = h0
+        c_t = c0
+        for step in range(self.opts.max_episode_len):     
+            navigable_obj_feat, viewpoints_indices = super(PanoSeq2SeqAgent, self).obj_navigable_feat(obs, ended) # should change pano_img_feat and navigable_feat
+            viewpoints, navigable_index, target_index = viewpoints_indices    
+
+            navigable_obj_feat = navigable_obj_feat.to(self.device)
+            target = torch.LongTensor(target_index).to(self.device)
+             # forward
+            r_t = r0 if step==0 else None
+            config_embedding, padded_mask= self.encoder(batch_configurations, configuration_num_list)
+            h_t, c_t, state_atten, logit, obj_attn, navigable_mask = self.model(config_embedding, padded_mask, state_atten, \
+            h_t, c_t, state_atten, r_t, navigable_index, navigable_obj_feat)
+     
+            logit.data.masked_fill_((navigable_mask == 0).data, -float('inf'))
+            loss += self.criterion(logit, target)
+          
+            # select action based on prediction
+            action = super(PanoSeq2SeqAgent, self)._select_action(logit, ended, target) 
+
+            next_viewpoints, next_headings, next_viewpoint_idx, ended = super(PanoSeq2SeqAgent, self)._next_viewpoint(
+                obs, viewpoints, navigable_index, action, ended)
+
+            # make a viewpoint change in the env
+            obs = self.env.step(scan_id, next_viewpoints, next_headings)
+
+
+            # save trajectory output and update last_recorded
+            traj, last_recorded = self.update_traj(obs, traj, obj_attn, state_atten, c_t, next_viewpoint_idx,
+                                                   navigable_index, ended, last_recorded)
+            
+            if last_recorded.all():
+                break
+
+            # check traj
+
+        return loss, traj
 
     def rollout(self):
         obs = np.array(self.env.reset())  # load a mini-batch
@@ -521,11 +637,9 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
         The constrained traditional beam search is set to mimic the "regret" action, i.e. at the viewpoint, sequentially
         choose the navigable direction according to action probability. If the progress monitor output increases,
         the agent will deterministically move forward.
-
         This is different from the traditional beam search, because:
         1. beams are not constrained to be from the same viewpoint
         2. all beams are completed
-
         :return:
         """
         obs = np.array(self.env.reset())  # load a mini-batch
