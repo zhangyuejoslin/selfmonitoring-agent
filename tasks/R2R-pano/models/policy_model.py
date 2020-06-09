@@ -257,7 +257,7 @@ class ConfiguringObject(nn.Module):
         self.hidden_size = rnn_hidden_size
 
         proj_navigable_kwargs = {
-            'input_dim': 2048,
+            'input_dim': 152,
             'hidden_dims': img_fc_dim,
             'use_batchnorm': img_fc_use_batchnorm,
             'dropout': img_dropout,
@@ -305,6 +305,36 @@ class ConfiguringObject(nn.Module):
         ctx_mask: batch x seq_len - indices to be masked
         """
         # input of image_feature should be changed
+        
+        batch_size, num_heading, num_object, object_feat_dim = obj_navigable_feat.size()
+        obj_navigable_feat = obj_navigable_feat.view(batch_size, num_heading*num_object, object_feat_dim) #4 x 16*36 x 152
+        index_length = [len(_index)+1 for _index in navigable_index]
+        navigable_mask = create_mask(batch_size, self.max_navigable, index_length)
+        navigable_obj_mask = create_mask_for_object(batch_size, self.max_navigable*num_object, index_length) #batch x 16*36
+        proj_navigable_feat = proj_masking(obj_navigable_feat, self.proj_navigable_mlp, navigable_obj_mask) # batch x 16*36 x 152 -> batch x 16*36 x 128
+
+
+        weighted_obj_feat, obj_attn = self.soft_attn(self.h0_fc(h_0), proj_navigable_feat, mask=navigable_obj_mask) # batch x 128
+
+        if r_t is None:
+            r_t = self.r_linear(torch.cat((weighted_obj_feat, h_0), dim=1)) 
+            r_t = self.sm(r_t)
+        weighted_config_feature, s_1 = self.state_attention(s_0, r_t, config_embedding, padded_mask) # batch x 768
+        concat_input = torch.cat((weighted_config_feature, weighted_obj_feat), dim=1)
+
+        h_1,c_1 = self.lstm(self.dropout(concat_input), (h_0, c_0))
+        h_1_drop = self.dropout(h_1) # batch x 256
+        h_tilde = self.logit_fc(h_1_drop)# batch x 128
+
+        weighted_conf_img_feat = self.config_attention(self.config_atten_linear(weighted_config_feature), proj_navigable_feat) # 4 x 16 x 128
+
+        logit = torch.bmm(weighted_conf_img_feat, h_tilde.unsqueeze(2)).squeeze(2) # 4 x 16
+
+        return h_1, c_1, s_1, logit, obj_attn, navigable_mask
+        
+        
+        # input of image_feature should be changed
+        '''
 
         batch_size, num_heading, num_object, object_feat_dim = obj_navigable_feat.size()
         obj_navigable_feat = obj_navigable_feat.view(batch_size, num_heading*num_object, object_feat_dim) #4 x 16*36 x 2048
@@ -312,7 +342,6 @@ class ConfiguringObject(nn.Module):
         navigable_mask = create_mask(batch_size, self.max_navigable, index_length)
         navigable_obj_mask = create_mask_for_object(batch_size, self.max_navigable*num_object, index_length) #batch x 16*36
         proj_navigable_feat = proj_masking(obj_navigable_feat, self.proj_navigable_mlp, navigable_obj_mask) # batch x 16*36 x 2048 -> batch x 16*36 x 128
-
 
         weighted_obj_feat, obj_attn = self.soft_attn(self.h0_fc(h_0), proj_navigable_feat, mask=navigable_obj_mask) # batch x 128
 
@@ -328,13 +357,10 @@ class ConfiguringObject(nn.Module):
  
         logit = torch.bmm(proj_navigable_feat, h_tilde.unsqueeze(2)).squeeze(2)
         logit = logit.view(batch_size, num_heading, num_object) # batch x 16 x 36
-        logit = self.config_attention(self.config_atten_linear(weighted_config_feature), proj_navigable_feat, logit)
-
-
-        #logit = logit.max(dim=2)[0] #batch x 16
+        logit = logit.max(dim=2)[0] #batch x 16
 
         return h_1, c_1, s_1, logit, obj_attn, navigable_mask
-
+        '''
         
         
 
