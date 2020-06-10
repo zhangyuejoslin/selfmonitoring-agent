@@ -19,8 +19,8 @@ class PanoBaseAgent(object):
         self.results_path = results_path
         random.seed(1)
         self.results = {}
-        self.image_feature_path = '/egr/research-hlr/joslin/Matterdata/v1/scans/pretrained_npy/'
-        self.image_cache = {}
+        self.object_feat_path = 'tasks/R2R-pano/152-object_feature1.npy'
+        self.object_feat = self.np_to_tensor(self.object_feat_path)
     
     def write_results(self):
         output = []
@@ -137,7 +137,7 @@ class PanoBaseAgent(object):
     def obj_navigable_feat(self, obs, ended):
         
         object_num = 36
-        feature_size = 2048
+        feature_size = 152
         navigable_feat = torch.zeros(len(obs), self.opts.max_navigable, object_num, feature_size)
 
         navigable_feat_index, target_index, viewpoints = [], [], []
@@ -171,26 +171,26 @@ class PanoBaseAgent(object):
 
         return navigable_feat, (viewpoints, navigable_feat_index, target_index)
     
-    def load_image_features(self, scan_id):
-        if len(self.image_cache) > 20:
-            delete_key = random.choice(list(self.image_cache))
-            if delete_key != scan_id:
-                del self.image_cache[delete_key]
-        if scan_id not in self.image_cache:
-            self.image_cache[scan_id] = np.load(self.image_feature_path + scan_id + ".npy", allow_pickle=True)
-        return self.image_cache[scan_id]
+    def np_to_tensor(self, object_feat_path):
+        all_obs_obj = np.load(self.object_feat_path, allow_pickle=True).item()
+        for scan_key, scan_value in all_obs_obj.items():
+            for state_key, state_value in scan_value.items():
+                for heading_key, heading_value in state_value.items():
+                    heading_value['features'] = torch.from_numpy(heading_value['features'])
+
+        return all_obs_obj
 
     
     def _faster_rcnn_feature(self, ob, heading_list):
         features = []
-        all_image_feature = self.load_image_features(ob['scan'])
         for heading in heading_list:
-            temp = int(round((heading*180/math.pi)/5) * 5)
+            temp = int(round((heading*180/math.pi)/30) * 30)
             if temp >=  360:
                 temp = temp - 360      
             elif temp < 0 :
                 temp = temp + 360
-            features.append(torch.from_numpy(all_image_feature.item()[ob['viewpoint']][temp*math.pi/180]['features']))
+            features.append(self.object_feat[ob['scan']][ob['viewpoint']][temp*math.pi/180]['features'])
+            #features.append(torch.from_numpy(all_image_feature.item()[ob['viewpoint']][temp*math.pi/180]['features']))
         features = torch.stack(features, dim=0)
 
         return features
@@ -387,7 +387,7 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
             logit.data.masked_fill_((navigable_mask == 0).data, -float('inf'))
             current_logit_loss = self.criterion(logit, target)
             # select action based on prediction
-            action = super(PanoSeq2SeqAgent, self)._select_action(logit, ended, fix_action_ended=self.opts.fix_action_ended)
+            action = super(PanoSeq2SeqAgent, self)._select_action(logit, ended, target, fix_action_ended=self.opts.fix_action_ended)
 
             if not self.opts.test_submission:
                 if step == 0:
@@ -430,7 +430,14 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
         batch_size = len(obs)
 
         batch_configurations, configuration_num_list = super(PanoSeq2SeqAgent, self)._config_batch(obs)
-
+        ctx, ctx_mask= self.encoder(batch_configurations, configuration_num_list)
+        if self.opts.arch == 'progress_aware_marker' or self.opts.arch == 'iclr_marker':
+            pre_feat = torch.zeros(batch_size, self.opts.img_feat_input_dim + self.opts.tiled_len).to(self.device)
+        else:
+            pre_feat = torch.zeros(batch_size, self.opts.img_feat_input_dim).to(self.device)
+        
+        pre_ctx_attend = torch.zeros(batch_size, self.opts.rnn_hidden_size).to(self.device)
+            
         # initialize the trajectory
         traj, scan_id, ended, last_recorded = self.init_traj(obs)
    
@@ -440,6 +447,8 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
         state_atten = state_attention_0
         h_t = h0
         c_t = c0
+        question = h_t
+        pre_feat = torch.zeros(batch_size, self.opts.img_feat_input_dim).to(self.device)
         for step in range(self.opts.max_episode_len):     
             pano_img_feat, navigable_feat, \
             viewpoints_indices = super(PanoSeq2SeqAgent, self).pano_navigable_feat(obs, ended) # should change pano_img_feat and navigable_feat
@@ -450,15 +459,32 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
             target = torch.LongTensor(target_index).to(self.device)
              # forward
             r_t = r0 if step==0 else None
-            config_embedding, padded_mask= self.encoder(batch_configurations, configuration_num_list)
-            h_t, c_t, state_atten, logit, img_attn, navigable_mask = self.model(config_embedding, padded_mask, state_atten, \
-            pano_img_feat, h_t, c_t, state_atten, r_t, navigable_index, navigable_feat)
-     
+           
+            h_t, c_t, pre_ctx_attend, img_attn, ctx_attn, logit, value, navigable_mask, state_atten = self.model(
+                pano_img_feat, navigable_feat, pre_feat, question, h_t, c_t, ctx,
+                pre_ctx_attend, state_atten, r_t, navigable_index, ctx_mask)
+
+            # set other values to -inf so that logsoftmax will not affect the final computed loss
             logit.data.masked_fill_((navigable_mask == 0).data, -float('inf'))
-            loss += self.criterion(logit, target)
-          
+            current_logit_loss = self.criterion(logit, target)
             # select action based on prediction
-            action = super(PanoSeq2SeqAgent, self)._select_action(logit, ended, target) 
+            action = super(PanoSeq2SeqAgent, self)._select_action(logit, ended, target, fix_action_ended=self.opts.fix_action_ended)
+
+            if not self.opts.test_submission:
+                if step == 0:
+                    current_loss = current_logit_loss
+                else:
+                    if self.opts.monitor_sigmoid:
+                        current_val_loss = self.get_value_loss_from_start_sigmoid(traj, value, ended)
+                    else:
+                        current_val_loss = self.get_value_loss_from_start(traj, value, ended)
+
+                    self.value_loss += current_val_loss
+                    current_loss = self.opts.value_loss_weight * current_val_loss + (
+                            1 - self.opts.value_loss_weight) * current_logit_loss
+            else:
+                current_loss = torch.zeros(1)  # during testing where we do not have ground-truth, loss is simply 0
+            loss += current_loss
 
             next_viewpoints, next_headings, next_viewpoint_idx, ended = super(PanoSeq2SeqAgent, self)._next_viewpoint(
                 obs, viewpoints, navigable_index, action, ended)
@@ -466,17 +492,20 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
             # make a viewpoint change in the env
             obs = self.env.step(scan_id, next_viewpoints, next_headings)
 
-
             # save trajectory output and update last_recorded
-            traj, last_recorded = self.update_traj(obs, traj, img_attn, state_atten, c_t, next_viewpoint_idx,
+            traj, last_recorded = self.update_traj(obs, traj, img_attn, ctx_attn, value, next_viewpoint_idx,
                                                    navigable_index, ended, last_recorded)
-            
+
+            pre_feat = navigable_feat[torch.LongTensor(range(batch_size)), action,:]
+
+            # Early exit if all ended
             if last_recorded.all():
                 break
 
-            # check traj
+        self.dist_from_goal = [traj_tmp['distance'][-1] for traj_tmp in traj]
 
         return loss, traj
+        
     
     def rollout_object_config(self):
         obs = np.array(self.env.reset()) # load a mini-batch
@@ -490,6 +519,7 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
         # Do a sequence rollout and calculate the loss
         loss = 0
         state_attention_0, r0, h0, c0 = self.encoder.init_state(batch_size, max(configuration_num_list))
+        config_embedding, padded_mask= self.encoder(batch_configurations, configuration_num_list)
         state_atten = state_attention_0
         h_t = h0
         c_t = c0
@@ -501,10 +531,9 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
             target = torch.LongTensor(target_index).to(self.device)
              # forward
             r_t = r0 if step==0 else None
-            config_embedding, padded_mask= self.encoder(batch_configurations, configuration_num_list)
-            h_t, c_t, state_atten, logit, obj_attn, navigable_mask = self.model(config_embedding, padded_mask, state_atten, \
+            
+            h_t, c_t, state_atten, logit, obj_attn, navigable_mask = self.model(config_embedding, padded_mask,
             h_t, c_t, state_atten, r_t, navigable_index, navigable_obj_feat)
-     
             logit.data.masked_fill_((navigable_mask == 0).data, -float('inf'))
             loss += self.criterion(logit, target)
           
@@ -1351,3 +1380,110 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
         self.all_visited_traj.append(done_beams[0]['traj']['path'])
 
         return done_beams[:beam_size]
+
+
+
+
+def sample_config_beam(self, beam_size=5):
+        obs = np.array(self.env.reset())  # load a mini-batch
+        batch_size = len(obs)
+
+        #seq, seq_lengths = super(PanoSeq2SeqAgent, self)._sort_batch(obs)
+
+        batch_configurations, configuration_num_list = super(PanoSeq2SeqAgent, self)._config_batch(obs)
+        config_embedding, padded_mask= self.encoder(batch_configurations, configuration_num_list)
+        ctx = config_embedding
+        ctx_mask = padded_mask
+        #ctx, h_t, c_t, ctx_mask = self.encoder(seq, seq_lengths)
+        state_attention_0, r0, h0, c0 = self.encoder.init_state(batch_size, max(configuration_num_list))
+        state_atten = state_attention_0
+        h_t = h0
+        c_t = c0
+
+        self.done_beams = [[] for _ in range(batch_size)]
+        batch_traj = []
+
+        # we perform beam search within each of the sample inside mini-batch
+        for k in range(batch_size):
+
+            # save the visited state to avoid the agent search to a visited state
+            self.visited_state = []
+
+            # save all visited states for test server submission
+            self.all_visited_traj = []
+
+            # take the sample in mini-batch and duplicate for number of beams
+            tmp_obs = np.repeat(obs[k:k+1], beam_size)
+            tmp_ctx = ctx[k:k+1].expand(beam_size, ctx.size(1), ctx.size(2))
+            tmp_h_t = h_t[k:k + 1].expand(beam_size, h_t.size(1))
+            tmp_c_t = c_t[k:k + 1].expand(beam_size, c_t.size(1))
+            tmp_ctx_mask = ctx_mask[k:k + 1].expand(beam_size, ctx_mask.size(1))
+
+            tmp_pre_feat = torch.zeros(beam_size, obs[0]['feature'].shape[1]).to(self.device)
+
+            tmp_question = h_t[k:k + 1].expand(beam_size, h_t.size(1))
+            #tmp_pre_ctx_attend = torch.zeros(beam_size, self.opts.rnn_hidden_size).to(self.device)
+            tmp_pre_ctx_attend = state_atten
+            tmp_seen_feat = torch.zeros(beam_size, 1, self.opts.rnn_hidden_size).to(self.device)
+
+            traj, scan_id = [], []
+            for ob in tmp_obs:
+                traj.append({
+                    'instr_id': ob['instr_id'],
+                    'path': [(ob['viewpoint'], ob['heading'], ob['elevation'])],
+                    'length': 1,
+                    'feature': [ob['feature']],
+                    'img_attn': [],
+                    'ctx_attn': [],
+                    'rollback_forward_attn': [],
+                    'value': [],
+                    'viewpoint_idx': [],
+                    'navigable_idx': [],
+                    'gt_viewpoint_idx': ob['gt_viewpoint_idx'],
+                    'distance': [super(PanoSeq2SeqAgent, self)._get_distance(ob)]
+                })
+                scan_id.append(ob['scan'])
+                if (ob['viewpoint'], ob['heading']) not in self.visited_state:
+                    self.visited_state.append((ob['viewpoint'], ob['heading']))
+
+            ended = np.array([False] * beam_size)
+            last_recorded = np.array([False] * beam_size)
+
+            viewpoints, navigable_index, navigable_feat, tmp_h_t, tmp_c_t, logit, value, tmp_img_attn, tmp_ctx_attn, \
+            tmp_pre_ctx_attend = self.model_config_seen_step(tmp_obs, ended, tmp_pre_feat, tmp_h_t, tmp_c_t, tmp_ctx, tmp_ctx_mask,
+                                                 tmp_question, tmp_pre_ctx_attend)
+
+            logprobs = F.log_softmax(logit, dim=1)
+            logprobs_value = ((value + 1) / 2).log()
+
+            self.done_beams[k] = self.beam_search(k, logprobs, tmp_obs, traj, ended, last_recorded,
+                                                  viewpoints, navigable_index, navigable_feat, tmp_pre_feat,
+                                                  tmp_ctx, tmp_img_attn, tmp_ctx_attn, tmp_h_t,
+                                                  tmp_c_t, tmp_ctx_mask, beam_size,
+                                                  tmp_seen_feat, tmp_question, tmp_pre_ctx_attend, logprobs_value)
+
+            batch_traj.append(self.done_beams[k][0]['traj'])
+
+        return batch_traj
+
+
+def model_config_seen_step(self, tmp_obs, ended, tmp_pre_feat, tmp_h_t, tmp_c_t, tmp_ctx, tmp_ctx_mask,
+                        tmp_question, tmp_pre_ctx_attend):
+
+        pano_img_feat, navigable_feat, viewpoints_indices = super(PanoSeq2SeqAgent, self).pano_navigable_feat(tmp_obs,
+                                                                                                              ended)
+        viewpoints, navigable_index, target_index = viewpoints_indices
+
+        pano_img_feat = pano_img_feat.to(self.device)
+        navigable_feat = navigable_feat.to(self.device)
+
+        # forward pass the network
+        tmp_h_t, tmp_c_t, pre_ctx_attend, img_attn, ctx_attn, logit, value, \
+        navigable_mask = self.model(pano_img_feat, navigable_feat, tmp_pre_feat, tmp_question, tmp_h_t,
+                                    tmp_c_t, tmp_ctx, tmp_pre_ctx_attend, navigable_index=navigable_index,
+                                    ctx_mask=tmp_ctx_mask)
+
+        # we mask out output
+        logit.data.masked_fill_((navigable_mask == 0).data, -float('inf'))
+
+        return viewpoints, navigable_index, navigable_feat, tmp_h_t, tmp_c_t, logit, value, img_attn, ctx_attn, pre_ctx_attend
