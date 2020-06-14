@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from models.modules import build_mlp, SoftAttention, PositionalEncoding, ScaledDotProductAttention, create_mask, create_mask_for_object, proj_masking, PositionalEncoding, StateAttention, ConfigAttention, ConfigObjAttention
+from models.modules import build_mlp, SoftAttention, ImageSoftAttention, TextSoftAttention, PositionalEncoding, ScaledDotProductAttention, create_mask, create_mask_for_object, proj_masking, PositionalEncoding, StateAttention, ConfigAttention, ConfigObjAttention
 
 class SelfMonitoring(nn.Module):
     """ An unrolled LSTM with attention over instructions for decoding navigation actions. """
@@ -30,7 +30,8 @@ class SelfMonitoring(nn.Module):
         self.h0_fc = nn.Linear(rnn_hidden_size, img_fc_dim[-1], bias=fc_bias)
         self.h1_fc = nn.Linear(rnn_hidden_size, rnn_hidden_size, bias=fc_bias)
 
-        self.soft_attn = SoftAttention()
+        self.text_soft_attn = TextSoftAttention()
+        self.img_soft_attn = ImageSoftAttention()
 
         self.r_linear = nn.Linear(rnn_hidden_size + 128, 2)
 
@@ -84,10 +85,10 @@ class SelfMonitoring(nn.Module):
         proj_pre_feat = self.proj_navigable_mlp(pre_feat)
         positioned_ctx = self.lang_position(ctx)
 
-        weighted_ctx, ctx_attn = self.soft_attn(self.h1_fc(h_0), positioned_ctx, mask=ctx_mask)
+        weighted_ctx, ctx_attn = self.text_soft_attn(self.h1_fc(h_0), positioned_ctx, mask=ctx_mask)
 
 
-        weighted_img_feat, img_attn = self.soft_attn(self.h0_fc(h_0), proj_navigable_feat, mask=navigable_mask)
+        weighted_img_feat, img_attn = self.img_soft_attn(self.h0_fc(h_0), proj_navigable_feat, mask=navigable_mask)
 
         # if r_t is None:
         #     r_t = self.r_linear(torch.cat((weighted_img_feat, h_0), dim=1)) 
@@ -272,7 +273,6 @@ class Configuring(nn.Module):
         proj_navigable_feat = proj_masking(navigable_feat, self.proj_navigable_mlp, navigable_mask)
         proj_pre_feat = self.proj_navigable_mlp(pre_feat)
 
-
         weighted_img_feat, img_attn = self.soft_attn(self.h0_fc(h_0), proj_navigable_feat, mask=navigable_mask)
 
         
@@ -366,13 +366,14 @@ class ConfiguringObject(nn.Module):
        # self.logit_fc = nn.Linear(rnn_hidden_size, img_fc_dim[-1])
         self.logit_fc = nn.Linear(rnn_hidden_size * 2, img_fc_dim[-1])
 
-        self.r_linear = nn.Linear(rnn_hidden_size + 128, 2)
+        self.r_linear = nn.Linear(rnn_hidden_size + 128, 4)
 
         self.image_linear = nn.Linear(img_feat_input_dim, img_fc_dim[-1])
 
         self.config_fc = nn.Linear(768, 512, bias=False)
 
-        self.config_atten_linear = nn.Linear(768, 128)
+        self.config_atten_linear = nn.Linear(512, 128)
+        #self.config_atten_linear = nn.Linear(768, 128)
 
         self.sm = nn.Softmax(dim=1)
 
@@ -402,6 +403,7 @@ class ConfiguringObject(nn.Module):
         ctx_mask: batch x seq_len - indices to be masked
         """
         # input of image_feature should be changed
+    
         
         batch_size, num_heading, num_object, object_feat_dim = navigable_obj_feat.size()
         navigable_obj_feat = navigable_obj_feat.view(batch_size, num_heading*num_object, object_feat_dim) #4 x 16*36 x 152
@@ -415,19 +417,39 @@ class ConfiguringObject(nn.Module):
 
         proj_pre_feat = self.proj_navigable_img_mlp(pre_feat)
 
-        weighted_obj_feat, obj_attn = self.soft_attn(self.h0_fc(h_0), proj_navigable_obj_feat, mask=navigable_obj_mask) # batch x 128
-        obj_attn = obj_attn.view(batch_size, num_heading, num_object) # batch x 36 x 16
-        obj_attn = torch.sum(obj_attn, dim=2) # batch x 16
+        # first use soft attention to object to be the input of r
+        pre_weighted_img_feat, img_attn = self.soft_attn(self.h0_fc(h_0), proj_navigable_feat, mask=navigable_mask)
+      #  weighted_obj_feat, obj_attn = self.soft_attn(self.h0_fc(h_0), proj_navigable_obj_feat, mask=navigable_obj_mask) # batch x 128
 
-        weighted_img_feat = torch.bmm(obj_attn.unsqueeze(dim=1), self.image_linear(navigable_img_feat)).squeeze(dim=1)# batch x 2176
-
+        # if r_t is None:
+        #     r_t = self.r_linear(torch.cat((weighted_obj_feat, h_0), dim=1)) [stop, 1/4, 1/2, go]
+        #     r_t = self.sm(r_t)
 
         if r_t is None:
-            r_t = self.r_linear(torch.cat((weighted_img_feat, h_0), dim=1)) 
+            r_t = self.r_linear(torch.cat((pre_weighted_img_feat, h_0), dim=1))
             r_t = self.sm(r_t)
+            r_t[0] = r_t[0] + r_t[2] * 0.75
+            r_t[1] = r_t[1] + r_t[2] * 0.25
+            r_t[0] = r_t[0] + r_t[3] * 0.5
+            r_t[1] = r_t[1] + r_t[3] * 0.5
+
+        weighted_ctx, ctx_attn = self.state_attention(s_0, r_t[:, :2], self.config_fc(ctx), ctx_mask)
+
+        #second use the selected configuration to be the attention to select the object
+
+        conf_obj_feat = self.config_obj_attention(self.config_atten_linear(weighted_ctx), proj_navigable_obj_feat, navigable_mask) # 4 x 16 x 128
+        weighted_conf_obj_feat, conf_obj_attn = self.soft_attn(self.h0_fc(h_0), conf_obj_feat, mask=navigable_mask) # 4 x 128
+        weighted_img_feat = torch.bmm(conf_obj_attn.unsqueeze(dim=1), self.image_linear(navigable_img_feat)).squeeze(dim=1)# batch x 2176
+
+        # third use the conf_obj_attn to select the image
+
+        # obj_attn = obj_attn.view(batch_size, num_heading, num_object) # batch x 36 x 16
+        # obj_attn = torch.sum(obj_attn, dim=2) # batch x 16
+        # weighted_img_feat = torch.bmm(obj_attn.unsqueeze(dim=1), self.image_linear(navigable_img_feat)).squeeze(dim=1)# batch x 2176
 
 
-        weighted_ctx, ctx_attn = self.state_attention(s_0, r_t, self.config_fc(ctx), ctx_mask)
+        # fourth use the selected object to be the attention to select the corresponding iamge
+        
 
         concat_input = torch.cat((proj_pre_feat, weighted_img_feat, weighted_ctx), 1)
 
@@ -446,24 +468,24 @@ class ConfiguringObject(nn.Module):
         value = self.critic(torch.cat((ctx_attn, h_1_value), dim=1))
     
         return h_1, c_1, weighted_ctx, obj_attn, ctx_attn, logit, value, navigable_mask
+    
         
-        
-        # input of image_feature should be changed
         '''
-
-        batch_size, num_heading, num_object, object_feat_dim = obj_navigable_feat.size()
-        obj_navigable_feat = obj_navigable_feat.view(batch_size, num_heading*num_object, object_feat_dim) #4 x 16*36 x 2048
+        # input of image_feature should be changed
+    
+        batch_size, num_heading, num_object, object_feat_dim = navigable_obj_feat.size()
+        navigable_obj_feat = navigable_obj_feat.view(batch_size, num_heading*num_object, object_feat_dim) #4 x 16*36 x 2048
         index_length = [len(_index)+1 for _index in navigable_index]
         navigable_mask = create_mask(batch_size, self.max_navigable, index_length)
         navigable_obj_mask = create_mask_for_object(batch_size, self.max_navigable*num_object, index_length) #batch x 16*36
-        proj_navigable_feat = proj_masking(obj_navigable_feat, self.proj_navigable_mlp, navigable_obj_mask) # batch x 16*36 x 2048 -> batch x 16*36 x 128
+        proj_navigable_feat = proj_masking(navigable_obj_feat, self.proj_navigable_obj_mlp, navigable_obj_mask) # batch x 16*36 x 2048 -> batch x 16*36 x 128
 
         weighted_obj_feat, obj_attn = self.soft_attn(self.h0_fc(h_0), proj_navigable_feat, mask=navigable_obj_mask) # batch x 128
 
         if r_t is None:
             r_t = self.r_linear(torch.cat((weighted_obj_feat, h_0), dim=1)) 
             r_t = self.sm(r_t)
-        weighted_config_feature, s_1 = self.state_attention(s_0, r_t, config_embedding, padded_mask) # batch x 768
+        weighted_config_feature, s_1 = self.state_attention(s_0, r_t, ctx, ctx_mask) # batch x 768
         concat_input = torch.cat((weighted_config_feature, weighted_obj_feat), dim=1)
 
         h_1,c_1 = self.lstm(self.dropout(concat_input), (h_0, c_0))

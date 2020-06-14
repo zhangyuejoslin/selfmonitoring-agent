@@ -441,6 +441,7 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
     
     def rollout_config(self):
         obs = np.array(self.env.reset()) # load a mini-batch
+        max_config_num = 0
         batch_size = len(obs)
         #check again
         batch_configurations, configuration_num_list = super(PanoSeq2SeqAgent, self)._config_batch(obs)
