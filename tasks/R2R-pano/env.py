@@ -12,21 +12,22 @@ import base64
 import random
 import networkx as nx
 
-from utils import load_datasets, load_nav_graphs, print_progress, is_experiment
+from utils import load_datasets, load_nav_graphs, print_progress, is_experiment, get_configurations
 
 csv.field_size_limit(sys.maxsize)
 
-def load_features(feature_store):
+def load_features(feature_store, whether_img_feat):
     def _make_id(scanId, viewpointId):
         return scanId + '_' + viewpointId
 
     # if the tsv file for image features is provided
-    if feature_store:
+    if feature_store and whether_img_feat:
         tsv_fieldnames = ['scanId', 'viewpointId', 'image_w', 'image_h', 'vfov', 'features']
         features = {}
         with open(feature_store, "r") as tsv_in_file:
             print('Reading image features file %s' % feature_store)
             reader = list(csv.DictReader(tsv_in_file, delimiter='\t', fieldnames=tsv_fieldnames))
+            #reader = reader[1:]
             total_length = len(reader)
 
             print('Loading image features ..')
@@ -39,6 +40,7 @@ def load_features(feature_store):
                                                        dtype=np.float32).reshape((36, 2048))
                 print_progress(i + 1, total_length, prefix='Progress:',
                                suffix='Complete', bar_length=50)
+            #features['17DRP5sb8fy_10c252c90fa24ef3b698c6f54d984c5c'] = np.zeros((36, 152)
     else:
         print('Image features not provided')
         features = None
@@ -81,11 +83,13 @@ class PanoEnvBatch():
         for sim in self.sims:
             state = sim.getState()
             long_id = self._make_id(state.scanId, state.location.viewpointId)
+
             if self.features:
                 feature = self.features[long_id]  # features.shape = (36, 2048)
                 feature_states.append((feature, state))
             else:
                 feature_states.append((None, state))
+
 
         return feature_states
 
@@ -93,11 +97,12 @@ class PanoEnvBatch():
 class R2RPanoBatch():
     """ Implements the Room to Room navigation task, using discretized viewpoints and pretrained features """
 
-    def __init__(self, opts, features, img_spec, batch_size=64, seed=10, splits=['train'], tokenizer=None):
+    def __init__(self, opts, features, img_spec, batch_size=64, seed=10, splits=['train'], tokenizer=None, configuration=False):
         self.env = PanoEnvBatch(features, img_spec, batch_size=batch_size)
         self.data = []
         self.scans = []
         self.opts = opts
+        self.configuration = configuration
 
         print('Loading {} dataset'.format(splits[0]))
 
@@ -115,20 +120,31 @@ class R2RPanoBatch():
                 new_item = dict(item)
                 new_item['instr_id'] = '%s_%d' % (item['path_id'], j)
                 new_item['instructions'] = instr
+                if configuration:
+                    new_item['configurations'] = get_configurations(instr)
+                    self.data.append((len(new_item['configurations']), new_item))
+                else:
+                    self.data.append(new_item)
                 if tokenizer:
                     if 'instr_encoding' not in item:  # we may already include 'instr_encoding' when generating synthetic instructions
                         new_item['instr_encoding'] = tokenizer.encode_sentence(instr)
                     else:
                         new_item['instr_encoding'] = item['instr_encoding']
-                self.data.append(new_item)
+
             print_progress(i + 1, total_length, prefix='Progress:',
                                suffix='Complete', bar_length=50)
 
+        if configuration:
+            self.data.sort(key=lambda x: x[0])
+            self.data = list(map(lambda item:item[1], self.data))
+
+        else:
+            self.seed = seed
+            random.seed(self.seed)
+            random.shuffle(self.data)
+
         self.scans = set(self.scans)
-        self.splits = splits
-        self.seed = seed
-        random.seed(self.seed)
-        random.shuffle(self.data)
+        self.splits = splits     
         self.ix = 0
         self.batch_size = batch_size
         self._load_nav_graphs()
@@ -359,6 +375,7 @@ class R2RPanoBatch():
                 'step': state.step,
                 'navigableLocations': navigable,
                 'instructions': item['instructions'],
+                'configurations': item['configurations'],
                 'teacher': item['path'],
                 'new_teacher': self.paths[state.scanId][state.location.viewpointId][item['path'][-1]],
                 'gt_viewpoint_idx': gt_viewpoint_idx
