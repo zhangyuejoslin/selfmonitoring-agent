@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.autograd import Variable
 
 from models.modules import build_mlp, SoftAttention, ImageSoftAttention, TextSoftAttention, PositionalEncoding, ScaledDotProductAttention, create_mask, create_mask_for_object, proj_masking, PositionalEncoding, StateAttention, ConfigAttention, ConfigObjAttention
 
@@ -83,9 +84,9 @@ class SelfMonitoring(nn.Module):
 
         proj_navigable_feat = proj_masking(navigable_feat, self.proj_navigable_mlp, navigable_mask)
         proj_pre_feat = self.proj_navigable_mlp(pre_feat)
-        positioned_ctx = self.lang_position(ctx)
+        #positioned_ctx = self.lang_position(ctx)
 
-        weighted_ctx, ctx_attn = self.text_soft_attn(self.h1_fc(h_0), positioned_ctx, mask=ctx_mask)
+        weighted_ctx, ctx_attn = self.text_soft_attn(self.h1_fc(h_0), ctx, mask=ctx_mask)
 
 
         weighted_img_feat, img_attn = self.img_soft_attn(self.h0_fc(h_0), proj_navigable_feat, mask=navigable_mask)
@@ -390,6 +391,8 @@ class ConfiguringObject(nn.Module):
                 nn.Tanh()
             )
 
+        self.r_transform = Variable(torch.tensor([[1,0,0.75,0.5],[0,1,0.25,0.5]]).transpose(0,1), requires_grad=False)
+
 
     def forward(self, navigable_img_feat, navigable_obj_feat, pre_feat, question, h_0, c_0, ctx, pre_ctx_attend, \
                 s_0, r_t, navigable_index, ctx_mask):
@@ -425,15 +428,22 @@ class ConfiguringObject(nn.Module):
         #     r_t = self.r_linear(torch.cat((weighted_obj_feat, h_0), dim=1)) [stop, 1/4, 1/2, go]
         #     r_t = self.sm(r_t)
 
-        if r_t is None:
-            r_t = self.r_linear(torch.cat((pre_weighted_img_feat, h_0), dim=1))
-            r_t = self.sm(r_t)
-            r_t[0] = r_t[0] + r_t[2] * 0.75
-            r_t[1] = r_t[1] + r_t[2] * 0.25
-            r_t[0] = r_t[0] + r_t[3] * 0.5
-            r_t[1] = r_t[1] + r_t[3] * 0.5
+        # if r_t is None:
+        #     r_t = self.r_linear(torch.cat((pre_weighted_img_feat, h_0), dim=1))
+        #     r_t = self.sm(r_t)
+        
+       
+        # new_r_transform = self.r_transform.to(r_t.device)
+        # new_r_t = torch.matmul(r_t, new_r_transform)
+        # r_t0 = torch.matmul(r_t, torch.tensor([1,0,0.75,0.5], device=r_t.device))
+        # r_t1 = torch.matmul(r_t, torch.tensor([0,1,0.25,0.5], device=r_t.device))
+        # new_r_t = torch.stack([r_t0, r_t1], dim=1)
+    
+            
+            # r_t[:,0] = r_t[:,0] * 1 + r_t[:,1] * 0 + r_t[:,2] * 0.75 + r_t[:,3] * 0.5
+            # r_t[:,1] = r_t[:,0] * 0 + r_t[:,1] * 1 + r_t[:,2] * 0.25 + r_t[:,3] * 0.5
 
-        weighted_ctx, ctx_attn = self.state_attention(s_0, r_t[:, :2], self.config_fc(ctx), ctx_mask)
+        weighted_ctx, ctx_attn = self.state_attention(s_0, new_r_t, self.config_fc(ctx), ctx_mask)
 
         #second use the selected configuration to be the attention to select the object
 
@@ -467,7 +477,7 @@ class ConfiguringObject(nn.Module):
 
         value = self.critic(torch.cat((ctx_attn, h_1_value), dim=1))
     
-        return h_1, c_1, weighted_ctx, obj_attn, ctx_attn, logit, value, navigable_mask
+        return h_1, c_1, weighted_ctx, conf_obj_attn, ctx_attn, logit, value, navigable_mask
     
         
         '''
