@@ -202,9 +202,7 @@ class SoftAttention(nn.Module):
             attn.data.masked_fill_((token_mask == 0).data, -float('inf')) #batch x 10 x 13
 
         attn = self.softmax(attn)
-        attn [attn!=attn] = 0
-        weighted_token_input = torch.matmul(attn.unsqueeze(dim=2), token_input).squeeze(2) # batch x 10 x 768
-
-     
+        new_attn = torch.where(attn != attn, torch.zeros_like(attn), attn)
+        weighted_token_input = torch.matmul(new_attn.unsqueeze(dim=2), token_input).squeeze(2) # batch x 10 x 768
 
         return  weighted_token_input, attn
