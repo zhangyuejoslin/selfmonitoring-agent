@@ -77,6 +77,7 @@ class EncoderConfigBert(nn.Module):
         self.num_directions = 2 if bidirectional else 1
         self.num_layers = num_layers
         self.hidden_size = hidden_size
+        self.sf = SoftAttention(dimension=embedding_size)
     
     def init_state(self, batch_size, max_config_num):
         """ Initial state of model
@@ -94,7 +95,7 @@ class EncoderConfigBert(nn.Module):
         a0[:,0] = 1
         r0 = Variable(torch.zeros(
             batch_size, 
-            2, 
+            4, 
             device=self.bert_model.device
             ), requires_grad=False)
         r0[:,0] = 1
@@ -113,7 +114,9 @@ class EncoderConfigBert(nn.Module):
     def bert_embedding(self, inputs, sep_list):
         start = 0
         features = []
+        token_features = []
         padded_masks = []
+        token_padded_masks = []
         tokenized_dict = self.bert_tokenizer.batch_encode_plus(inputs, add_special_tokens=True, return_attention_mask=True, return_tensors='pt', pad_to_max_length=True)
        
         padded = tokenized_dict['input_ids'].to(self.bert_model.device)
@@ -133,7 +136,15 @@ class EncoderConfigBert(nn.Module):
             feature = temp_feature[start:end,0,:]
            
             feature = torch.zeros(max_length, temp_feature.shape[2], device=self.bert_model.device)
-            feature[0:(end-start), :] = temp_feature [start:end,0,:]
+            token_feature = torch.zeros(max_length, temp_feature.shape[1], temp_feature.shape[2], device=self.bert_model.device)
+            token_padded_mask = torch.zeros(max_length,temp_feature.shape[1], device=self.bert_model.device)
+
+            feature[0:(end-start), :] = temp_feature[start:end,0,:]
+            token_feature[0:(end-start),:,:] = temp_feature[start:end,:,:] # 10 x 13 x 768
+            
+            # tmp_token_padded_mask = padded[start:end]
+            # token_padded_mask[0:(end-start),:]= torch.where(tmp_token_padded_mask>0, torch.full_like(tmp_token_padded_mask, 1), tmp_token_padded_mask)
+            token_padded_mask[0:(end-start),:] = attention_mask[start:end]
             start += each_sep
             # max_config_num * embedding_size (3 * 768)
     
@@ -141,19 +152,59 @@ class EncoderConfigBert(nn.Module):
             # 1 * max_config_num (1 * 3)
             padded_mask = torch.zeros(max_length, device=self.bert_model.device)
             padded_mask[:each_sep] = 1
+
             features.append(feature)
+            token_features.append(token_feature)
             padded_masks.append(padded_mask)
+            token_padded_masks.append(token_padded_mask)
         # batch_size * max_config_num * embedding_size (100 * 3 * 768)
         features = torch.stack(features, dim=0)
         # batch_size * 1 * max_config_num (100 * 1 * 3)
         padded_masks = torch.stack(padded_masks, dim= 0)
 
-        return features, padded_masks
+        token_features = torch.stack(token_features, dim=0)
+
+        token_padded_masks = torch.stack(token_padded_masks, dim=0)
+
+        return features, padded_masks, token_features, token_padded_masks
     
     def forward(self, inputs, sep_list):
         """
         embeds: batch x max_len_config x embedding_size
         a_t: batch x max_len_config  
         """
-        embeds, padded_mask = self.bert_embedding(inputs, sep_list)   
-        return embeds, padded_mask
+        embeds, padded_mask, token_features, token_padded_masks = self.bert_embedding(inputs, sep_list)  # 10 x 768
+        weighted_embeds, attn = self.sf(embeds, padded_mask, token_features,token_padded_masks) # 10 x 768; 10 x  x 768
+
+        return weighted_embeds, padded_mask
+
+class SoftAttention(nn.Module):
+    """Soft-Attention without learnable parameters
+    """
+
+    def __init__(self, dimension):
+        super(SoftAttention, self).__init__()
+        self.softmax = nn.Softmax(dim=2)
+        self.conf_linear = nn.Linear(768, 768)
+
+    def forward(self, cls_input, cls_mask, token_input, token_mask):
+        """Propagate h through the network.
+        cls_input: batch x 10 x 768
+        cls_mask: batch x 10
+        cls_input: batch x 10 x max_token_len x 768
+        token_mask: batch x 10 x 13
+        """
+        # Get attention
+        cls_input = self.conf_linear(cls_input)
+        attn = torch.matmul(cls_input.unsqueeze(dim=2), token_input.transpose(2,3)).squeeze(2)  # batch x 10 x 13
+
+        if token_mask is not None:
+            attn.data.masked_fill_((token_mask == 0).data, -float('inf')) #batch x 10 x 13
+
+        attn = self.softmax(attn)
+        attn [attn!=attn] = 0
+        weighted_token_input = torch.matmul(attn.unsqueeze(dim=2), token_input).squeeze(2) # batch x 10 x 768
+
+     
+
+        return  weighted_token_input, attn
