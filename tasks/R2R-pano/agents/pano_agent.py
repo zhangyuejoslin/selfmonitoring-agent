@@ -21,8 +21,12 @@ class PanoBaseAgent(object):
         self.results_path = results_path
         random.seed(1)
         self.results = {}
-        self.object_feat_path = 'tasks/R2R-pano/152-object_feature1.npy'
-        self.object_feat = self.np_to_tensor(self.object_feat_path)
+        #self.object_img_feat_path = 'tasks/R2R-pano/152-object_feature1.npy'
+
+        self.object_feat_path = 'img_features/object_representation_glove1.npy'
+        tmp_obj_feat, tmp_obj_img_feat = self.np_to_tensor(self.object_feat_path)
+        self.object_img_feat = tmp_obj_img_feat
+        self.object_feat = tmp_obj_feat
         #self.features, img_spec = load_features('img_features/ResNet-152-imagenet.tsv', True)
     
     def write_results(self):
@@ -144,15 +148,20 @@ class PanoBaseAgent(object):
     def obj_navigable_feat(self, obs, ended):
         
         object_num = 36
-        feature_size = 152
+        feature_size1 = 300
+        feature_size2 = 152
         num_feature, img_feature_size = obs[0]['feature'].shape
         
         pano_img_feat = torch.zeros(len(obs), num_feature, img_feature_size)
 
-        navigable_obj_feat = torch.zeros(len(obs), self.opts.max_navigable, object_num, feature_size)
+        navigable_obj_feat = torch.zeros(len(obs), self.opts.max_navigable, object_num, feature_size1)
+        object_mask = torch.zeros(len(obs), self.opts.max_navigable, object_num)
+        
+        navigable_obj_img_feat = torch.zeros(len(obs), self.opts.max_navigable, object_num, feature_size2)
         navigable_img_feat = torch.zeros(len(obs), self.opts.max_navigable, img_feature_size)
      
         next_img_feat = torch.zeros(len(obs), self.opts.max_navigable, 36, 2048)
+
 
 
         navigable_feat_index, target_index, viewpoints = [], [], []
@@ -186,7 +195,10 @@ class PanoBaseAgent(object):
             viewpoints.append(viewpoints_tmp)
             heading_list = heading_list[1:]
             navigable_img_feat[i, 1:len(navi_index) + 1] = pano_img_feat[i, navi_index]
-            navigable_obj_feat[i, 1:len(navi_index) + 1] = self._faster_rcnn_feature(ob, heading_list)
+            tmp_obj_feat, tmp_mask, tmp_obj_img_feat = self._faster_rcnn_feature(ob, heading_list)
+            navigable_obj_feat[i, 1:len(navi_index) + 1] =  tmp_obj_feat
+            object_mask[i, 1:len(navi_index) + 1] = tmp_mask
+            navigable_obj_img_feat[i, 1:len(navi_index) + 1] = tmp_obj_img_feat
            # next_img_feat[i, 1:len(navi_index)+1] = next_img_feat_list
 
 
@@ -194,32 +206,48 @@ class PanoBaseAgent(object):
             # navigable_obj_feat[i, 1:len(navi_index) + 1] = torch.cat([self._faster_rcnn_feature(ob, heading_list), tmp_img_feat], dim=-1)
 
         #return navigable_img_feat, navigable_obj_feat, next_img_feat, (viewpoints, navigable_feat_index, target_index)
-        return navigable_img_feat, navigable_obj_feat, (viewpoints, navigable_feat_index, target_index)
+        return navigable_img_feat, navigable_obj_feat, navigable_obj_img_feat, object_mask, (viewpoints, navigable_feat_index, target_index)
     
     
-    def np_to_tensor(self, object_feat_path):
+    def np_to_tensor(self, object_feat_path1):
         all_obs_obj = np.load(self.object_feat_path, allow_pickle=True).item()
+        all_obs_obj_img = np.load("img_features/152-object_feature2.npy", allow_pickle=True).item()
         for scan_key, scan_value in all_obs_obj.items():
             for state_key, state_value in scan_value.items():
                 for heading_key, heading_value in state_value.items():
-                    heading_value['features'] = torch.from_numpy(heading_value['features'])
+                    heading_value['text_feature'] = torch.from_numpy(heading_value['text_feature'])
+                    heading_value['text_mask'] = torch.from_numpy(heading_value['text_mask'])
+        for scan_key, scan_value in all_obs_obj_img.items():
+            for state_key, state_value in scan_value.items():
+                for heading_key, heading_value in state_value.items():
+                    heading_value['features'] = torch.from_numpy(heading_value['features'])     
 
-        return all_obs_obj
+        return all_obs_obj, all_obs_obj_img
 
     
     def _faster_rcnn_feature(self, ob, heading_list):
+        obj_img = []
         features = []
+        feature_mask = []
         for heading in heading_list:
             temp = int(round((heading*180/math.pi)/30) * 30)
             if temp >=  360:
                 temp = temp - 360      
             elif temp < 0 :
                 temp = temp + 360
-            features.append(self.object_feat[ob['scan']][ob['viewpoint']][temp*math.pi/180]['features'])
-            #features.append(torch.from_numpy(all_image_feature.item()[ob['viewpoint']][temp*math.pi/180]['features']))
-        features = torch.stack(features, dim=0)
+            features.append(self.object_feat[ob['scan']][ob['viewpoint']][temp*math.pi/180]['text_feature'])
+            feature_mask.append(self.object_feat[ob['scan']][ob['viewpoint']][temp*math.pi/180]['text_mask'])
+            obj_img.append(self.object_img_feat[ob['scan']][ob['viewpoint']][temp*math.pi/180]['features'])
+          
+            # except KeyError:
+            #     features.append(torch.zeros(36, 300))
+            #     feature_mask.append(torch.zeros(36))
+            #     obj_img.append(torch.zeros(36, 152))
 
-        return features
+        features = torch.stack(features, dim=0)
+        feature_mask = torch.stack(feature_mask, dim=0)
+        obj_img = torch.stack(obj_img, dim=0)
+        return features, feature_mask, obj_img
 
     def _sort_batch(self, obs):
         """ Extract instructions from a list of observations and sort by descending
@@ -250,12 +278,27 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
         self.feedback = feedback
         self.episode_len = episode_len
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.atten_weight = {}
         
         self.ignore_index = opts.max_navigable + 1  # we define (max_navigable+1) as ignore since 15(navigable) + 1(STOP)
         self.criterion = nn.CrossEntropyLoss(ignore_index=self.ignore_index)
 
+       # self.landmark_feature = self.get_landmark_feature()
+
         self.MSELoss = nn.MSELoss()
         self.MSELoss_sum = nn.MSELoss(reduction='sum')
+    
+    def get_landmark_feature(self):
+        landmark_dict = {}
+        landmark_dict1 = np.load('tasks/R2R-pano/landmark1.npy', allow_pickle=True).item()
+        landmark_dict2 = np.load('tasks/R2R-pano/landmark2.npy', allow_pickle=True).item()
+        landmark_dict3 = np.load('tasks/R2R-pano/landmark.npy', allow_pickle=True).item()
+        landmark_dict4 = np.load('tasks/R2R-pano/landmark_test.npy', allow_pickle=True).item()
+        landmark_dict.update(landmark_dict1)
+        landmark_dict.update(landmark_dict2)
+        landmark_dict.update(landmark_dict3)
+        landmark_dict.update(landmark_dict4)
+        return landmark_dict
 
     def get_value_loss_from_start(self, traj, predicted_value, ended, norm_value=True, threshold=5):
         """
@@ -374,9 +417,12 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
 
         return traj, last_recorded
 
-
     def rollout_monitor(self):
+        quan_matrix = []
         obs = np.array(self.env.reset())  # load a mini-batch
+        instr_id_list = []
+        for ob in obs:
+            instr_id_list.append(ob['instr_id'])
         batch_size = len(obs)
 
         seq, seq_lengths = super(PanoSeq2SeqAgent, self)._sort_batch(obs)
@@ -410,6 +456,7 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
             h_t, c_t, pre_ctx_attend, img_attn, ctx_attn, logit, value, navigable_mask = self.model(
                 pano_img_feat, navigable_feat, pre_feat, question, h_t, c_t, ctx,
                 pre_ctx_attend, navigable_index, ctx_mask)
+            quan_matrix.append(ctx_attn.detach().cpu().numpy())
 
             # set other values to -inf so that logsoftmax will not affect the final computed loss
             logit.data.masked_fill_((navigable_mask == 0).data, -float('inf'))
@@ -450,210 +497,224 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
                 break
 
         self.dist_from_goal = [traj_tmp['distance'][-1] for traj_tmp in traj]
+        quan_matrix = np.stack(quan_matrix, axis=1)
+        for matrix_id, each_matrix in enumerate(quan_matrix):
+            self.atten_weight[instr_id_list[matrix_id]] = {"attention_weight" : each_matrix}
+
 
         return loss, traj
 
-    # def rollout_monitor(self):
-    #     obs = np.array(self.env.reset())  # load a mini-batch
-    #     batch_size = len(obs)
-    #     split_index = []
-    #     token_num = 0
-    #     sentence = []
-    #     '''
-    #     seq, seq_lengths = super(PanoSeq2SeqAgent, self)._sort_batch(obs)
-    #     ctx, h_t, c_t, ctx_mask = self.encoder(sentence, seq_lengths) 
-    #     '''
+
+    
+    def rollout_monitor1(self):
+        quan_matrix = []
+        instr_id_list = []
+        obs = np.array(self.env.reset())  # load a mini-batch
+        batch_size = len(obs)
+        split_index = []
+        token_num = 0
+        sentence = []
+        '''
+        seq, seq_lengths = super(PanoSeq2SeqAgent, self)._sort_batch(obs)
+        ctx, h_t, c_t, ctx_mask = self.encoder(sentence, seq_lengths) 
+        '''
 
   
-    #         #sentence.append(ob['instructions'])
-    # #     seq, seq_lengths = super(PanoSeq2SeqAgent, self)._sort_batch(obs)
-    # #    # ctx, ctx_mask = self.encoder(sentence, seq_lengths) 
-    # #     state_attention_0, r0, h0, c0 = self.encoder.init_state(batch_size, max(configuration_num_list))
-    # #     h_t = h0
-    # #     c_t = c0
+            #sentence.append(ob['instructions'])
+    #     seq, seq_lengths = super(PanoSeq2SeqAgent, self)._sort_batch(obs)
+    #    # ctx, ctx_mask = self.encoder(sentence, seq_lengths) 
+    #     state_attention_0, r0, h0, c0 = self.encoder.init_state(batch_size, max(configuration_num_list))
+    #     h_t = h0
+    #     c_t = c0
         
 
-    #     ''' split and then combine
+        ''' split and then combine
     
-    #     # ctx = torch.zeros(batch_size, 80, 512, device=self.device)
-    #     # h_t = []
-    #     # c_t = []
-    #     # ctx_mask = torch.zeros(batch_size, 80, device=self.device)
-    #     # all_ctx = []
-    #     # all_length = []
-    #     # all_length_list = []
+        # ctx = torch.zeros(batch_size, 80, 512, device=self.device)
+        # h_t = []
+        # c_t = []
+        # ctx_mask = torch.zeros(batch_size, 80, device=self.device)
+        # all_ctx = []
+        # all_length = []
+        # all_length_list = []
         
-    #     # for ob_id, ob in enumerate(obs):
-    #     #     seq, seq_lengths = super(PanoSeq2SeqAgent, self)._sort_batch(ob)
-    #     #     all_ctx.append(seq)
-    #     #     all_length_list.append(seq_lengths)
-    #     #     all_length += seq_lengths
-    #     # all_ctx = torch.cat(all_ctx, dim=0)
+        # for ob_id, ob in enumerate(obs):
+        #     seq, seq_lengths = super(PanoSeq2SeqAgent, self)._sort_batch(ob)
+        #     all_ctx.append(seq)
+        #     all_length_list.append(seq_lengths)
+        #     all_length += seq_lengths
+        # all_ctx = torch.cat(all_ctx, dim=0)
 
-    #     # ctx_encode_tensor, tmp_h_t, tmp_c_t, ctx_encode_mask = self.encoder(all_ctx, all_length)
-    #     # start = 0
-    #     # for ob_id, each_l in enumerate(all_length_list):
-    #     #     tmp_ctx = []
-    #     #     end = start + len(each_l)
-    #     #     each_ctx = ctx_encode_tensor[start:end,:]
-    #     #     h_t.append(tmp_h_t[start:end][-1,:])
-    #     #     c_t.append(tmp_c_t[start:end][-1,:])
-    #     #     for id, each_length in enumerate(each_l) :
-    #     #         tmp_ctx.append(each_ctx[id,:each_length,:])
-    #     #     tmp_ctx = torch.cat(tmp_ctx, dim=0)
+        # ctx_encode_tensor, tmp_h_t, tmp_c_t, ctx_encode_mask = self.encoder(all_ctx, all_length)
+        # start = 0
+        # for ob_id, each_l in enumerate(all_length_list):
+        #     tmp_ctx = []
+        #     end = start + len(each_l)
+        #     each_ctx = ctx_encode_tensor[start:end,:]
+        #     h_t.append(tmp_h_t[start:end][-1,:])
+        #     c_t.append(tmp_c_t[start:end][-1,:])
+        #     for id, each_length in enumerate(each_l) :
+        #         tmp_ctx.append(each_ctx[id,:each_length,:])
+        #     tmp_ctx = torch.cat(tmp_ctx, dim=0)
 
-    #     #     if tmp_ctx.shape[0] <= 80:
-    #     #         ctx[ob_id,:tmp_ctx.shape[0],:] = tmp_ctx
-    #     #     else:
-    #     #         ctx[ob_id,:tmp_ctx.shape[0],:] = tmp_ctx[:80, :]
-    #     #     ctx_mask[ob_id,:tmp_ctx.shape[0]] = 1
-    #     #     start = end
+        #     if tmp_ctx.shape[0] <= 80:
+        #         ctx[ob_id,:tmp_ctx.shape[0],:] = tmp_ctx
+        #     else:
+        #         ctx[ob_id,:tmp_ctx.shape[0],:] = tmp_ctx[:80, :]
+        #     ctx_mask[ob_id,:tmp_ctx.shape[0]] = 1
+        #     start = end
         
-    #     # h_t = torch.stack(h_t)
-    #     # c_t = torch.stack(c_t)
-    #     '''
+        # h_t = torch.stack(h_t)
+        # c_t = torch.stack(c_t)
+        '''
 
-    #     # s0 = torch.zeros(batch_size, 80).to(self.device)
-    #     # r0 = torch.zeros(batch_size, 2).to(self.device)
+        # s0 = torch.zeros(batch_size, 80).to(self.device)
+        # r0 = torch.zeros(batch_size, 2).to(self.device)
 
-    #     # batch_configurations, configuration_num_list = super(PanoSeq2SeqAgent, self)._config_batch(obs)
-    #     # ctx, ctx_mask= self.encoder(batch_configurations, configuration_num_list)
-    #     # state_attention_0, r0, h_t, c_t = self.encoder.init_state(batch_size, max(configuration_num_list))
-    #     ''' combine then split'''
-    #     # for ob in obs:
-    #     #     tmp_split_index = list(np.where(ob['instr_encoding']==992)[0])
-    #     #     if tmp_split_index[-1] > token_num:
-    #     #         token_num = tmp_split_index[-1]
-    #     #     split_index.append(tmp_split_index)
-    #     # batch_configurations, configuration_num_list = super(PanoSeq2SeqAgent, self)._config_batch(obs)
-    #     # s0, r0, h0, c0 = self.encoder.init_state(batch_size, max(configuration_num_list))
-    #     # seq, seq_lengths = super(PanoSeq2SeqAgent, self)._sort_batch(obs)
+        # batch_configurations, configuration_num_list = super(PanoSeq2SeqAgent, self)._config_batch(obs)
+        # ctx, ctx_mask= self.encoder(batch_configurations, configuration_num_list)
+        # state_attention_0, r0, h_t, c_t = self.encoder.init_state(batch_size, max(configuration_num_list))
+        ''' combine then split'''
+        # for ob in obs:
+        #     tmp_split_index = list(np.where(ob['instr_encoding']==992)[0])
+        #     if tmp_split_index[-1] > token_num:
+        #         token_num = tmp_split_index[-1]
+        #     split_index.append(tmp_split_index)
+        # batch_configurations, configuration_num_list = super(PanoSeq2SeqAgent, self)._config_batch(obs)
+        # s0, r0, h0, c0 = self.encoder.init_state(batch_size, max(configuration_num_list))
+        # seq, seq_lengths = super(PanoSeq2SeqAgent, self)._sort_batch(obs)
 
-    #     # tmp_ctx, h_t, c_t, tmp_ctx_mask = self.encoder(seq, seq_lengths)
-    #     # new_ctx = torch.zeros(batch_size, 15, token_num, 512, device = tmp_ctx.device)
-    #     # new_ctx_mask = torch.zeros(batch_size, 15, token_num, device = tmp_ctx.device)
-    #     # new_cls = torch.zeros(batch_size, 15, 512, device = tmp_ctx.device)
-    #     # new_cls_mask = torch.zeros(batch_size, 15, device = tmp_ctx.device)
+        # tmp_ctx, h_t, c_t, tmp_ctx_mask = self.encoder(seq, seq_lengths)
+        # new_ctx = torch.zeros(batch_size, 15, token_num, 512, device = tmp_ctx.device)
+        # new_ctx_mask = torch.zeros(batch_size, 15, token_num, device = tmp_ctx.device)
+        # new_cls = torch.zeros(batch_size, 15, 512, device = tmp_ctx.device)
+        # new_cls_mask = torch.zeros(batch_size, 15, device = tmp_ctx.device)
  
-    #     # for ob_id, each_index_list in enumerate(split_index):
-    #     #     start = 0
-    #     #     for list_id, each_index in enumerate(each_index_list):
-    #     #         end = each_index
-    #     #         new_ctx[ob_id,list_id,0:end-start,:] = tmp_ctx[ob_id,start:end,:]
-    #     #         new_ctx_mask[ob_id, list_id,0:end-start] = 1
-    #     #         new_cls[ob_id, list_id, :] = tmp_ctx[ob_id, each_index,:]
-    #     #         new_cls_mask[ob_id, list_id] = 1
-    #     #         start = end + 1
-    #     # weighted_new_ctx, attn = self.encoder.sf(new_cls, new_cls_mask, new_ctx, new_ctx_mask)
-    #     # ctx = weighted_new_ctx
-    #     # ctx_mask = new_cls_mask    
-    #     # ctx_attn = s0
+        # for ob_id, each_index_list in enumerate(split_index):
+        #     start = 0
+        #     for list_id, each_index in enumerate(each_index_list):
+        #         end = each_index
+        #         new_ctx[ob_id,list_id,0:end-start,:] = tmp_ctx[ob_id,start:end,:]
+        #         new_ctx_mask[ob_id, list_id,0:end-start] = 1
+        #         new_cls[ob_id, list_id, :] = tmp_ctx[ob_id, each_index,:]
+        #         new_cls_mask[ob_id, list_id] = 1
+        #         start = end + 1
+        # weighted_new_ctx, attn = self.encoder.sf(new_cls, new_cls_mask, new_ctx, new_ctx_mask)
+        # ctx = weighted_new_ctx
+        # ctx_mask = new_cls_mask    
+        # ctx_attn = s0
         
 
         
-    #     # bert and split
-    #     seq, seq_lengths = super(PanoSeq2SeqAgent, self)._sort_batch(obs)
-    #     for ob in obs:
-    #         sentence.append(" quan ".join(ob['configurations']) + " quan")
-    #     tmp_ctx, h_t, c_t, tmp_ctx_mask, split_index = self.encoder(sentence, seq_lengths)
-    #     for each_split in split_index:
-    #         if each_split[-1] > token_num:
-    #             token_num = each_split[-1]
-    #     batch_configurations, configuration_num_list = super(PanoSeq2SeqAgent, self)._config_batch(obs)
-    #     s0, r0, h0, c0 = self.encoder.init_state(batch_size, max(configuration_num_list))
-    #     seq, seq_lengths = super(PanoSeq2SeqAgent, self)._sort_batch(obs)
+        # bert and split
+        seq, seq_lengths = super(PanoSeq2SeqAgent, self)._sort_batch(obs)
+        for ob in obs:
+            instr_id_list.append(ob['instr_id'])
+            sentence.append(" quan ".join(ob['configurations']) + " quan")
+        tmp_ctx, h_t, c_t, tmp_ctx_mask, split_index = self.encoder(sentence, seq_lengths)
+        for each_split in split_index:
+            if each_split[-1] > token_num:
+                token_num = each_split[-1]
+        batch_configurations, configuration_num_list = super(PanoSeq2SeqAgent, self)._config_batch(obs)
+        seq, seq_lengths = super(PanoSeq2SeqAgent, self)._sort_batch(obs)
 
         
-    #     new_ctx = torch.zeros(batch_size, 15, token_num, 512, device = tmp_ctx.device)
-    #     new_ctx_mask = torch.zeros(batch_size, 15, token_num, device = tmp_ctx.device)
-    #     new_cls = torch.zeros(batch_size, 15, 512, device = tmp_ctx.device)
-    #     new_cls_mask = torch.zeros(batch_size, 15, device = tmp_ctx.device)
+        new_ctx = torch.zeros(batch_size, 15, token_num, 512, device = tmp_ctx.device)
+        new_ctx_mask = torch.zeros(batch_size, 15, token_num, device = tmp_ctx.device)
+        new_cls = torch.zeros(batch_size, 15, 512, device = tmp_ctx.device)
+        new_cls_mask = torch.zeros(batch_size, 15, device = tmp_ctx.device)
  
-    #     for ob_id, each_index_list in enumerate(split_index):
-    #         start = 0
-    #         for list_id, each_index in enumerate(each_index_list):
-    #             end = each_index
-    #             new_ctx[ob_id,list_id,0:end-start,:] = tmp_ctx[ob_id,start:end,:]
-    #             new_ctx_mask[ob_id, list_id,0:end-start] = 1
-    #             new_cls[ob_id, list_id, :] = tmp_ctx[ob_id, each_index,:]
-    #             new_cls_mask[ob_id, list_id] = 1
-    #             start = end + 1
-    #     weighted_new_ctx, attn = self.encoder.sf(new_cls, new_cls_mask, new_ctx, new_ctx_mask)
-    #     ctx = weighted_new_ctx
-    #     ctx_mask = new_cls_mask    
-    #     ctx_attn = s0
-        
+        for ob_id, each_index_list in enumerate(split_index):
+            start = 0
+            for list_id, each_index in enumerate(each_index_list):
+                end = each_index
+                new_ctx[ob_id,list_id,0:end-start,:] = tmp_ctx[ob_id,start:end,:]
+                new_ctx_mask[ob_id, list_id,0:end-start] = 1
+                new_cls[ob_id, list_id, :] = tmp_ctx[ob_id, each_index,:]
+                new_cls_mask[ob_id, list_id] = 1
+                start = end + 1
+        weighted_new_ctx, attn = self.encoder.sf(new_cls, new_cls_mask, new_ctx, new_ctx_mask)
+        ctx = weighted_new_ctx
+        ctx_mask = new_cls_mask    
+        s0, r0, h0, c0 = self.encoder.init_state(batch_size, max(configuration_num_list),ctx_mask)
+        ctx_attn = s0 
       
-    #     question = h_t
+        question = h_t
 
-    #     if self.opts.arch == 'progress_aware_marker' or self.opts.arch == 'iclr_marker':
-    #         pre_feat = torch.zeros(batch_size, self.opts.img_feat_input_dim + self.opts.tiled_len).to(self.device)
-    #     else:
-    #         pre_feat = torch.zeros(batch_size, self.opts.img_feat_input_dim).to(self.device)
+        if self.opts.arch == 'progress_aware_marker' or self.opts.arch == 'iclr_marker':
+            pre_feat = torch.zeros(batch_size, self.opts.img_feat_input_dim + self.opts.tiled_len).to(self.device)
+        else:
+            pre_feat = torch.zeros(batch_size, self.opts.img_feat_input_dim).to(self.device)
 
-    #     # Mean-Pooling over segments as previously attended ctx
-    #     pre_ctx_attend = torch.zeros(batch_size, self.opts.rnn_hidden_size).to(self.device)
+        # Mean-Pooling over segments as previously attended ctx
+        pre_ctx_attend = torch.zeros(batch_size, self.opts.rnn_hidden_size).to(self.device)
 
-    #     # initialize the trajectory
-    #     traj, scan_id, ended, last_recorded = self.init_traj(obs)
+        # initialize the trajectory
+        traj, scan_id, ended, last_recorded = self.init_traj(obs)
 
-    #     loss = 0
-    #     for step in range(self.opts.max_episode_len):
+        loss = 0
+        for step in range(self.opts.max_episode_len):
 
-    #         pano_img_feat, navigable_feat, \
-    #         viewpoints_indices = super(PanoSeq2SeqAgent, self).pano_navigable_feat(obs, ended)
-    #         viewpoints, navigable_index, target_index = viewpoints_indices
+            pano_img_feat, navigable_feat, \
+            viewpoints_indices = super(PanoSeq2SeqAgent, self).pano_navigable_feat(obs, ended)
+            viewpoints, navigable_index, target_index = viewpoints_indices
 
-    #         pano_img_feat = pano_img_feat.to(self.device)
-    #         navigable_feat = navigable_feat.to(self.device)
-    #         target = torch.LongTensor(target_index).to(self.device)
+            pano_img_feat = pano_img_feat.to(self.device)
+            navigable_feat = navigable_feat.to(self.device)
+            target = torch.LongTensor(target_index).to(self.device)
 
-    #         # forward pass the network
-    #         r_t = r0 if step==0 else None
-    #         h_t, c_t, pre_ctx_attend, img_attn, ctx_attn, logit, value, navigable_mask = self.model(
-    #             pano_img_feat, navigable_feat, pre_feat, question, h_t, c_t, ctx, pre_ctx_attend, ctx_attn, r_t, navigable_index, ctx_mask)
+            # forward pass the network
+            r_t = r0 if step==0 else None
+            h_t, c_t, pre_ctx_attend, img_attn, ctx_attn, logit, value, navigable_mask = self.model(
+                pano_img_feat, navigable_feat, pre_feat, question, h_t, c_t, ctx, pre_ctx_attend, ctx_attn, r_t, navigable_index, ctx_mask)
+            quan_matrix.append(ctx_attn.detach().cpu().numpy())
 
-    #         # set other values to -inf so that logsoftmax will not affect the final computed loss
-    #         logit.data.masked_fill_((navigable_mask == 0).data, -float('inf'))
-    #         current_logit_loss = self.criterion(logit, target)
-    #         # select action based on prediction
-    #         action = super(PanoSeq2SeqAgent, self)._select_action(logit, ended, target, fix_action_ended=self.opts.fix_action_ended)
+            # set other values to -inf so that logsoftmax will not affect the final computed loss
+            logit.data.masked_fill_((navigable_mask == 0).data, -float('inf'))
+            current_logit_loss = self.criterion(logit, target)
+            # select action based on prediction
+            action = super(PanoSeq2SeqAgent, self)._select_action(logit, ended, target, fix_action_ended=self.opts.fix_action_ended)
 
-    #         if not self.opts.test_submission:
-    #             if step == 0:
-    #                 current_loss = current_logit_loss
-    #             else:
-    #                 if self.opts.monitor_sigmoid:
-    #                     current_val_loss = self.get_value_loss_from_start_sigmoid(traj, value, ended)
-    #                 else:
-    #                     current_val_loss = self.get_value_loss_from_start(traj, value, ended)
+            if not self.opts.test_submission:
+                if step == 0:
+                    current_loss = current_logit_loss
+                else:
+                    if self.opts.monitor_sigmoid:
+                        current_val_loss = self.get_value_loss_from_start_sigmoid(traj, value, ended)
+                    else:
+                        current_val_loss = self.get_value_loss_from_start(traj, value, ended)
 
-    #                 self.value_loss += current_val_loss
-    #                 current_loss = self.opts.value_loss_weight * current_val_loss + (
-    #                         1 - self.opts.value_loss_weight) * current_logit_loss
-    #         else:
-    #             current_loss = torch.zeros(1)  # during testing where we do not have ground-truth, loss is simply 0
-    #         loss += current_loss
+                    self.value_loss += current_val_loss
+                    current_loss = self.opts.value_loss_weight * current_val_loss + (
+                            1 - self.opts.value_loss_weight) * current_logit_loss
+            else:
+                current_loss = torch.zeros(1)  # during testing where we do not have ground-truth, loss is simply 0
+            loss += current_loss
 
-    #         next_viewpoints, next_headings, next_viewpoint_idx, ended = super(PanoSeq2SeqAgent, self)._next_viewpoint(
-    #             obs, viewpoints, navigable_index, action, ended)
+            next_viewpoints, next_headings, next_viewpoint_idx, ended = super(PanoSeq2SeqAgent, self)._next_viewpoint(
+                obs, viewpoints, navigable_index, action, ended)
 
-    #         # make a viewpoint change in the env
-    #         obs = self.env.step(scan_id, next_viewpoints, next_headings)
+            # make a viewpoint change in the env
+            obs = self.env.step(scan_id, next_viewpoints, next_headings)
 
-    #         # save trajectory output and update last_recorded
-    #         traj, last_recorded = self.update_traj(obs, traj, img_attn, ctx_attn, value, next_viewpoint_idx,
-    #                                                navigable_index, ended, last_recorded)
+            # save trajectory output and update last_recorded
+            traj, last_recorded = self.update_traj(obs, traj, img_attn, ctx_attn, value, next_viewpoint_idx,
+                                                   navigable_index, ended, last_recorded)
 
-    #         pre_feat = navigable_feat[torch.LongTensor(range(batch_size)), action,:]
+            pre_feat = navigable_feat[torch.LongTensor(range(batch_size)), action,:]
 
-    #         # Early exit if all ended
-    #         if last_recorded.all():
-    #             break
+            # Early exit if all ended
+            if last_recorded.all():
+                break
 
-    #     self.dist_from_goal = [traj_tmp['distance'][-1] for traj_tmp in traj]
+        self.dist_from_goal = [traj_tmp['distance'][-1] for traj_tmp in traj]
+        quan_matrix = np.stack(quan_matrix, axis=1)
+        for matrix_id, each_matrix in enumerate(quan_matrix):
+            self.atten_weight[instr_id_list[matrix_id]] = {"attention_weight" : each_matrix}
 
-    #     return loss, traj
+        return loss, traj
+
+
 
     def rollout_config(self):
         obs = np.array(self.env.reset()) # load a mini-batch
@@ -675,7 +736,7 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
    
         # Do a sequence rollout and calculate the loss
         loss = 0
-        state_attention_0, r0, h0, c0 = self.encoder.init_state(batch_size, max(configuration_num_list))
+        state_attention_0, r0, h0, c0 = self.encoder.init_state(batch_size, max(configuration_num_list),)
         ctx_attn = state_attention_0
         h_t = h0
         c_t = c0
@@ -690,6 +751,7 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
             navigable_feat = navigable_feat.to(self.device)
             target = torch.LongTensor(target_index).to(self.device)
              # forward
+            
             r_t = r0 if step==0 else None
            
             h_t, c_t, pre_ctx_attend, img_attn, ctx_attn, logit, value, navigable_mask = self.model(
@@ -777,21 +839,36 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
         ctx_attn = s0
         """
         seq, seq_lengths = super(PanoSeq2SeqAgent, self)._sort_batch(obs)
+        landmark_list = []
+        instr_id_list = []
+        config_num_list = []
         for ob in obs:
+            instr_id_list.append(ob['instr_id'])
+            config_num_list.append(len(ob['configurations']))
+            tmp_landmark_list = []
+            for config_id, each_config in enumerate(ob['configurations']):
+                tmp_landmark = self.landmark_feature[ob["instr_id"]+"_"+str(config_id)]
+                if tmp_landmark is None:
+                    tmp_landmark = np.zeros(300)
+                tmp_landmark_list.append(torch.tensor(tmp_landmark, dtype=torch.float))
+            tmp_landmark_list = torch.stack(tmp_landmark_list, dim=0)
+            landmark_list.append(tmp_landmark_list)
             sentence.append(" quan ".join(ob['configurations']) + " quan")
+            
         tmp_ctx, h_t, c_t, tmp_ctx_mask, split_index = self.encoder(sentence, seq_lengths)
         for each_split in split_index:
             if each_split[-1] > token_num:
                 token_num = each_split[-1]
         batch_configurations, configuration_num_list = super(PanoSeq2SeqAgent, self)._config_batch(obs)
-        s0, r0, h0, c0 = self.encoder.init_state(batch_size, max(configuration_num_list))
+       
         seq, seq_lengths = super(PanoSeq2SeqAgent, self)._sort_batch(obs)
 
-        
         new_ctx = torch.zeros(batch_size, 15, token_num, 512, device = tmp_ctx.device)
         new_ctx_mask = torch.zeros(batch_size, 15, token_num, device = tmp_ctx.device)
         new_cls = torch.zeros(batch_size, 15, 512, device = tmp_ctx.device)
         new_cls_mask = torch.zeros(batch_size, 15, device = tmp_ctx.device)
+        landmark_tensor = torch.zeros(batch_size, 15, 300, device = tmp_ctx.device)
+
  
         for ob_id, each_index_list in enumerate(split_index):
             start = 0
@@ -803,8 +880,13 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
                 new_cls_mask[ob_id, list_id] = 1
                 start = end + 1
         weighted_new_ctx, attn = self.encoder.sf(new_cls, new_cls_mask, new_ctx, new_ctx_mask)
+        for each_id, each_config_tensor in enumerate(landmark_list):
+            landmark_tensor[each_id:,0:len(each_config_tensor),:] = each_config_tensor
+
+        weighted_new_ctx = torch.cat([weighted_new_ctx, landmark_tensor], dim=2)         
         ctx = weighted_new_ctx
-        ctx_mask = new_cls_mask    
+        ctx_mask = new_cls_mask  
+        s0, r0, h0, c0 = self.encoder.init_state(batch_size, max(configuration_num_list), ctx_mask)  
         ctx_attn = s0
 
         if self.opts.arch == 'progress_aware_marker' or self.opts.arch == 'iclr_marker':
@@ -819,20 +901,24 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
         # Do a sequence rollout and calculate the loss
         loss = 0
         question = h_t
-
+        
+        quan_matrix = []
         for step in range(self.opts.max_episode_len):     
-            navigable_img_feat, navigable_obj_feat, viewpoints_indices = super(PanoSeq2SeqAgent, self).obj_navigable_feat(obs, ended) # should change pano_img_feat and navigable_feat
+            navigable_img_feat, navigable_obj_feat, navigable_obj_img_feat, object_mask, viewpoints_indices = super(PanoSeq2SeqAgent, self).obj_navigable_feat(obs, ended) # should change pano_img_feat and navigable_feat
             viewpoints, navigable_index, target_index = viewpoints_indices  
 
             navigable_img_feat = navigable_img_feat.to(self.device)
             navigable_obj_feat = navigable_obj_feat.to(self.device)
-           # next_img_feat = next_img_feat.to(self.device)
+            navigable_obj_img_feat = navigable_obj_img_feat.to(self.device)
+            object_mask = object_mask.to(self.device)
             target = torch.LongTensor(target_index).to(self.device)
              # forward
             r_t = r0 if step==0 else None
             
-            h_t, c_t, pre_ctx_attend, img_attn, ctx_attn, logit, value, navigable_mask = self.model(navigable_img_feat, navigable_obj_feat, pre_feat, question, \
+            h_t, c_t, pre_ctx_attend, img_attn, ctx_attn, logit, value, navigable_mask = self.model(navigable_img_feat, navigable_obj_feat, navigable_obj_img_feat, object_mask, pre_feat, question, \
             h_t, c_t, ctx, pre_ctx_attend, ctx_attn, r_t, navigable_index, ctx_mask)
+
+            quan_matrix.append(ctx_attn.detach().cpu().numpy())
 
             logit.data.masked_fill_((navigable_mask == 0).data, -float('inf'))
             current_logit_loss = self.criterion(logit, target)
@@ -870,6 +956,10 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
             # Early exit if all ended
             if last_recorded.all():
                 break
+        
+        quan_matrix = np.stack(quan_matrix, axis=1)
+        for matrix_id, each_matrix in enumerate(quan_matrix):
+            self.atten_weight[instr_id_list[matrix_id]] = {"length":config_num_list[matrix_id], "attention_weight":each_matrix}
 
         self.dist_from_goal = [traj_tmp['distance'][-1] for traj_tmp in traj]
 

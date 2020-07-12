@@ -1,18 +1,22 @@
 import argparse
-
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = "1"
 import torch
 
 from env import R2RPanoBatch, load_features
 from eval import Evaluation
 from utils import setup, read_vocab, Tokenizer, set_tb_logger, is_experiment, padding_idx, resume_training, save_checkpoint
-from trainer import PanoSeq2SeqTrainer
+from trainer import PanoSeq2SeqTrainer, ConfigTrainer
 from agents import PanoSeq2SeqAgent
-from models import EncoderRNN, SelfMonitoring, SpeakerFollowerBaseline
+from models import EncoderRNN, EncoderConfigBert, SelfMonitoring, SpeakerFollowerBaseline, Configuring, ConfiguringObject
+import time
 
 
 parser = argparse.ArgumentParser(description='PyTorch for Matterport3D Agent with panoramic view and action')
 # General options
-parser.add_argument('--exp_name', default='experiments_', type=str,
+
+experiment_time = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+parser.add_argument('--exp_name', default='experiments_' + experiment_time + "/", type=str,
                     help='name of the experiment. \
                         It decides where to store samples and models')
 parser.add_argument('--exp_name_secondary', default='', type=str,
@@ -27,8 +31,9 @@ parser.add_argument('--trainval_vocab',
                     default='tasks/R2R-pano/data/trainval_vocab.txt',
                     type=str, help='path to training and validation vocab')
 parser.add_argument('--img_feat_dir',
-                    default='img_features/ResNet-152-imagenet.tsv',
+                    default='img_features/ResNet-152-imagenet.tsv', #ResNet-152-imagenet.tsv' #Object-152.tsv
                     type=str, help='path to pre-cached image features')
+parser.add_argument('--whether_img_feat', default=1, type=int, help="whether use Resenet feature or Fasterrcnn object feature")
 
 # Training options
 parser.add_argument('--start_epoch', default=1, type=int)
@@ -53,15 +58,16 @@ parser.add_argument('--epochs_data_augmentation', default=5, type=int,
 
 # General model options
 parser.add_argument('--arch', default='self-monitoring', type=str,
-                    help='options: self-monitoring | speaker-baseline')
+                    help='options: self-monitoring | speaker-baseline | configuration | configuration_object')
 parser.add_argument('--max_navigable', default=16, type=int,
                     help='maximum number of navigable locations in the dataset is 15 \
                          we add one because the agent can decide to stay at its current location')
 parser.add_argument('--use_ignore_index', default=1, type=int,
                     help='ignore target after agent has ended')
 
+
 # Agent options
-parser.add_argument('--follow_gt_traj', default=0, type=int,
+parser.add_argument('--follow_gt_traj', default=1, type=int,
                     help='the shortest path to the goal may not match with the instruction if we use student forcing, '
                          'we provide option that the next ground truth viewpoint will try to steer back to the original'
                          'ground truth trajectory')
@@ -70,26 +76,26 @@ parser.add_argument('--teleporting', default=1, type=int,
                          'viewpoint with roughly the same heading')
 parser.add_argument('--max_episode_len', default=10, type=int,
                     help='maximum length of episode')
-parser.add_argument('--feedback_training', default='sample', type=str,
-                    help='options: sample | mistake (this is the feedback for training only)')
+parser.add_argument('--feedback_training', default='argmax', type=str,
+                    help='options: sample | mistake | teacher (this is the feedback for training only)')
 parser.add_argument('--feedback', default='argmax', type=str,
                     help='options: sample | argmax (this is the feedback for testing only)')
 parser.add_argument('--value_loss_weight', default=0.5, type=float,
                     help='the weight applied on the auxiliary value loss')
 parser.add_argument('--norm_value', default=0, type=int,
                     help='when using value prediction, do we normalize the distance improvement as value target?')
-parser.add_argument('--mse_sum', default=1, type=int,
+parser.add_argument('--mse_sum', default=0, type=int,
                     help='when using value prediction, use MSE loss with sum or average across non-navigable directions?')
 parser.add_argument('--entropy_weight', default=0.0, type=float,
                     help='weighting for entropy loss')
-parser.add_argument('--fix_action_ended', default=1, type=int,
+parser.add_argument('--fix_action_ended', default=0, type=int,
                     help='Action set to 0 if ended. This prevent the model keep getting loss from logit after ended')
 parser.add_argument('--monitor_sigmoid', default=0, type=int,
                     help='Use Sigmoid function for progress monitor instead of Tanh')
 
 # Image context
 parser.add_argument('--img_feat_input_dim', default=2176, type=int,
-                    help='ResNet-152: 2048, if use angle, the input is 2176')
+                    help='ResNet-152: 2048, if use angle, the input is 2176/280')
 parser.add_argument('--img_fc_dim', default=(128,), nargs="+", type=int)
 parser.add_argument('--img_fc_use_batchnorm', default=1, type=int)
 parser.add_argument('--img_dropout', default=0.5, type=float)
@@ -104,13 +110,14 @@ parser.add_argument('--remove_punctuation', default=0, type=int,
 parser.add_argument('--reversed', default=1, type=int,
                     help='option for reversing the sentence during encoding')
 parser.add_argument('--lang_embed', default='lstm', type=str, help='options: lstm ')
-parser.add_argument('--word_embedding_size', default=256, type=int,
-                    help='default embedding_size for language encoder')
-parser.add_argument('--rnn_hidden_size', default=256, type=int)
+parser.add_argument('--word_embedding_size', default=768, type=int,
+                    help='default embedding_size for language encoder /256')
+parser.add_argument('--rnn_hidden_size', default=512, type=int)
 parser.add_argument('--bidirectional', default=0, type=int)
 parser.add_argument('--rnn_num_layers', default=1, type=int)
 parser.add_argument('--rnn_dropout', default=0.5, type=float)
-parser.add_argument('--max_cap_length', default=80, type=int, help='maximum length of captions')
+parser.add_argument('--max_cap_length', default=120, type=int, help='maximum length of captions')
+parser.add_argument('--use_configuration', default=True, help='configuration of sentence are splitted')
 
 # Evaluation options
 parser.add_argument('--eval_only', default=0, type=int,
@@ -121,7 +128,7 @@ parser.add_argument('--eval_beam', default=0, type=int,
                     help='No training. Resume from a model and run with beam search')
 parser.add_argument('--progress_inference', default=0, type=int,
                     help='No training. Resume from a model and run with Progress Inference')
-parser.add_argument('--beam_size', default=5, type=int,
+parser.add_argument('--beam_size', default=15, type=int,
                     help='The number of beams used with beam search')
 
 # Output options
@@ -131,14 +138,14 @@ parser.add_argument('--results_dir',
 parser.add_argument('--resume', default='', type=str,
                     help='two options for resuming the model: latest | best')
 parser.add_argument('--checkpoint_dir',
-                    default='tasks/R2R-pano/checkpoints/pano-seq2seq/',
+                    #default='tasks/R2R-pano/checkpoints/pano-seq2seq/',
+                    default= '/egr/research-hlr/joslin/Matterdata/v1/scans/chekpoints/',
                     type=str, help='where to save trained models')
 parser.add_argument('--tensorboard', default=1, type=int,
                     help='Use TensorBoard for loss visualization')
 parser.add_argument('--log_dir',
                     default='tensorboard_logs/pano-seq2seq',
                     type=str, help='path to tensorboard log files')
-
 
 def main(opts):
 
@@ -165,9 +172,11 @@ def main(opts):
     print('Using {} as encoder ...'.format(opts.lang_embed))
     if 'lstm' in opts.lang_embed:
         encoder = EncoderRNN(**encoder_kwargs)
+    elif 'bert' in opts.lang_embed:
+        encoder = EncoderConfigBert(**encoder_kwargs)
     else:
         raise ValueError('Unknown {} language embedding'.format(opts.lang_embed))
-    print(encoder)
+   # print(encoder)
 
     # create policy model
     policy_model_kwargs = {
@@ -186,9 +195,13 @@ def main(opts):
         model = SelfMonitoring(**policy_model_kwargs)
     elif opts.arch == 'speaker-baseline':
         model = SpeakerFollowerBaseline(**policy_model_kwargs)
+    elif opts.arch == "configuration":
+        model = Configuring(**policy_model_kwargs)
+    elif opts.arch == "configuration_object":
+        model = ConfiguringObject(**policy_model_kwargs)
     else:
         raise ValueError('Unknown {} model for seq2seq agent'.format(opts.arch))
-    print(model)
+   # print(model)
 
     encoder = encoder.to(device)
     model = model.to(device)
@@ -205,12 +218,12 @@ def main(opts):
     if opts.exp_name_secondary:
         opts.exp_name += opts.exp_name_secondary
 
-    feature, img_spec = load_features(opts.img_feat_dir)
+    feature, img_spec = load_features(opts.img_feat_dir, opts.whether_img_feat)
 
     if opts.test_submission:
         assert opts.resume, 'The model was not resumed before running for submission.'
         test_env = ('test', (R2RPanoBatch(opts, feature, img_spec, batch_size=opts.batch_size,
-                                 splits=['test'], tokenizer=tok), Evaluation(['test'])))
+                                 splits=['test'], tokenizer=tok, configuration=opts.use_configuration), Evaluation(['test'])))
         agent_kwargs = {
             'opts': opts,
             'env': test_env[1][0],
@@ -229,13 +242,13 @@ def main(opts):
     # set up R2R environments
     if not opts.train_data_augmentation:
         train_env = R2RPanoBatch(opts, feature, img_spec, batch_size=opts.batch_size, seed=opts.seed,
-                                 splits=['train'], tokenizer=tok)
+                                 splits=['train'], tokenizer=tok, configuration=opts.use_configuration)
     else:
         train_env = R2RPanoBatch(opts, feature, img_spec, batch_size=opts.batch_size, seed=opts.seed,
                                  splits=['synthetic'], tokenizer=tok)
 
     val_envs = {split: (R2RPanoBatch(opts, feature, img_spec, batch_size=opts.batch_size,
-                                     splits=[split], tokenizer=tok), Evaluation([split]))
+                                     splits=[split], tokenizer=tok, configuration=opts.use_configuration), Evaluation([split]))
                 for split in ['val_seen', 'val_unseen']}
 
     # create agent
@@ -250,7 +263,8 @@ def main(opts):
     agent = PanoSeq2SeqAgent(**agent_kwargs)
 
     # setup trainer
-    trainer = PanoSeq2SeqTrainer(opts, agent, optimizer, opts.train_iters_epoch)
+    #trainer = PanoSeq2SeqTrainer(opts, agent, optimizer, opts.train_iters_epoch)
+    trainer = ConfigTrainer(opts, agent, optimizer, opts.train_iters_epoch)
 
     if opts.eval_beam or opts.eval_only:
         success_rate = []
@@ -288,7 +302,7 @@ def main(opts):
                     'best_success_rate': best_success_rate,
                     'optimizer': optimizer.state_dict(),
                     'max_episode_len': opts.max_episode_len,
-                }, is_best, checkpoint_dir=opts.checkpoint_dir, name=opts.exp_name)
+                }, is_best, checkpoint_dir=opts.checkpoint_dir, epoch_num=epoch, name=opts.exp_name)
 
         if opts.train_data_augmentation and epoch == opts.epochs_data_augmentation:
             train_env = R2RPanoBatch(opts, feature, img_spec, batch_size=opts.batch_size, seed=opts.seed,

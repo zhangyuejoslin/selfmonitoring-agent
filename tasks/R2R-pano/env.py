@@ -12,7 +12,8 @@ import base64
 import random
 import networkx as nx
 
-from utils import load_datasets, load_nav_graphs, print_progress, is_experiment, get_configurations
+
+from utils import load_datasets, load_nav_graphs, print_progress, is_experiment, get_configurations, get_noun_chunks
 
 csv.field_size_limit(sys.maxsize)
 
@@ -103,6 +104,8 @@ class R2RPanoBatch():
         self.scans = []
         self.opts = opts
         self.configuration = configuration
+        self.landmark_noun = {}
+
 
         print('Loading {} dataset'.format(splits[0]))
 
@@ -120,19 +123,44 @@ class R2RPanoBatch():
                 new_item = dict(item)
                 new_item['instr_id'] = '%s_%d' % (item['path_id'], j)
                 new_item['instructions'] = instr
+                # new_item['instr_encoding'] = []
+                # if configuration:
+                #     new_item['configurations'] = get_configurations(instr)
+                #     self.data.append((len(new_item['configurations']), new_item))
+                # else:
+                #     self.data.append(new_item)
+                # if tokenizer:
+                #     if 'instr_encoding' not in item:  # we may already include 'instr_encoding' when generating synthetic instructions
+                #         new_item['instr_encoding'] = tokenizer.encode_sentence(instr)
+                #     else:
+                #         new_item['instr_encoding'] = item['instr_encoding']
                 if configuration:
                     new_item['configurations'] = get_configurations(instr)
+                    with open('tasks/R2R-pano/split_configuration.txt','a') as f1:
+                        pass
+
+
+                    # for config_id, each_config in enumerate(new_item['configurations']):
+                    #     if each_config == None:
+                    #         self.landmark_noun[new_item['instr_id']+"_"+ str(config_id)] = np.zeros(300)
+                    #     else:
+                    #         self.landmark_noun[new_item['instr_id']+"_"+ str(config_id)] = get_noun_chunks(each_config)
                     self.data.append((len(new_item['configurations']), new_item))
+
                 else:
                     self.data.append(new_item)
+
                 if tokenizer:
                     if 'instr_encoding' not in item:  # we may already include 'instr_encoding' when generating synthetic instructions
-                        new_item['instr_encoding'] = tokenizer.encode_sentence(instr)
+                        tmp_str = " Quan ".join(get_configurations(instr)) + " Quan"
+                        new_item['instr_encoding'] = tokenizer.encode_sentence(tmp_str)
                     else:
                         new_item['instr_encoding'] = item['instr_encoding']
-
+           
             print_progress(i + 1, total_length, prefix='Progress:',
                                suffix='Complete', bar_length=50)
+
+       # np.save("tasks/R2R-pano/landmark_test.npy", self.landmark_noun)
 
         if configuration:
             self.data.sort(key=lambda x: x[0])
