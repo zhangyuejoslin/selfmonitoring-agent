@@ -28,10 +28,17 @@ config = {
     'split_file' : 'tasks/R2R-pano/data/data/split_dictionary.txt',
     'stop_words_file': 'tasks/R2R-pano/data/data/stop_words.txt'
 }
+def split_oder(dictionary):
+    #def wordlen(string):
+    #    return len(string.split())
+    #print(sorted(dictionary, key = wordlen, reverse=True))
+    return sorted(dictionary, key = lambda x: len(x.split()), reverse=True)
 with open(config['split_file']) as f_dict:
     dictionary = f_dict.read().split('\n')
+    dictionary = split_oder(dictionary)
 with open(config["stop_words_file"]) as f_stop_word:
     stopword = f_stop_word.read().split('\n')
+    stopword = split_oder(stopword)
 
 
 def setup(opts, seed=1):
@@ -73,19 +80,23 @@ def load_nav_graphs(scans):
 
 def post_processing_sentence(sentence_list):
     def func(sl):
-        sl = sl.strip()
-        sl = sl.strip(".")
+        sl = sl.strip().strip(',').strip('.')
         for sw in stopword:
             if sl.endswith(" %s"%sw):
                 sl = sl[:-(len(sw)+1)]
-            elif sl.startswith("%s "%sw):
+            elif sl.endswith("%s"%sw):
+                sl = sl[:-len(sw)]
+            elif sl.startswith("%s "%sw) or sl.startswith(" %s"%sw):
                 sl = sl[len(sw)+1:]
+            elif sl.startswith("%s"%sw):
+                sl = sl[len(sw):]
         return sl
     sentence_list = list(map(func, sentence_list))
     new_sentence_list = []
     for sent in sentence_list:
         if sent !='':
-            new_sentence_list.append(sent)
+            sent = sent.strip().strip(',').strip('.')
+            new_sentence_list.append(sent.strip())
     return new_sentence_list
 
 def get_noun_chunks(each_configuration):
