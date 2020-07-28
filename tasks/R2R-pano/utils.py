@@ -11,6 +11,7 @@ from collections import Counter
 import numpy as np
 import networkx as nx
 import spacy
+from itertools import chain
 
 from tensorboardX import SummaryWriter
 
@@ -36,6 +37,9 @@ def split_oder(dictionary):
 with open(config['split_file']) as f_dict:
     dictionary = f_dict.read().split('\n')
     dictionary = split_oder(dictionary)
+    tmp_dict = list(filter(None,[each_phrase+"," for each_phrase in dictionary]))
+    dictionary = dictionary + tmp_dict
+    dictionary = [" "+each_phrase.strip()+" " for each_phrase in dictionary]
 with open(config["stop_words_file"]) as f_stop_word:
     stopword = f_stop_word.read().split('\n')
     stopword = split_oder(stopword)
@@ -93,36 +97,89 @@ def post_processing_sentence(sentence_list):
         return sl
     sentence_list = list(map(func, sentence_list))
     new_sentence_list = []
-    for sent in sentence_list:
+    tmp_id = 100
+    for id, sent in enumerate(sentence_list):
         if sent !='':
             sent = sent.strip().strip(',').strip('.')
-            new_sentence_list.append(sent.strip())
+            if sent.endswith('until you') or sent.endswith ('once you') or sent.endswith ('when you'):
+                tmp_sent = sent + " " + sentence_list[id+1]
+                tmp_id = id + 1
+                new_sentence_list.append(tmp_sent)
+            else:
+                if id == tmp_id:
+                    continue
+                else:
+                    new_sentence_list.append(sent.strip())
+            
     return new_sentence_list
+    # def func(sl):
+    #     sl = sl.strip().strip(',').strip('.')
+    #     for sw in stopword:
+    #         if sl.endswith(" %s"%sw):
+    #             sl = sl[:-(len(sw)+1)]
+    #         elif sl.endswith("%s"%sw):
+    #             sl = sl[:-len(sw)]
+    #         elif sl.startswith("%s "%sw) or sl.startswith(" %s"%sw):
+    #             sl = sl[len(sw)+1:]
+    #         elif sl.startswith("%s"%sw):
+    #             sl = sl[len(sw):]
+    #     return sl
+    # sentence_list = list(map(func, sentence_list))
+    # new_sentence_list = []
+    # for sent in sentence_list:
+    #     if sent !='':
+    #         sent = sent.strip().strip(',').strip('.')
+    #         new_sentence_list.append(sent.strip())
+    # return new_sentence_list
+
+def combine_process(config_list):
+    new_config_list = []
+    tmp_config_list = []
+    for id, each_config in enumerate(config_list):
+        tmp_config_list.append(each_config)
+        if each_config[0] != '' :
+            new_config_list.append(tmp_config_list)
+            tmp_config_list = []
+    if tmp_config_list:
+        if new_config_list:
+            new_config_list[-1].extend(tmp_config_list)
+        else:
+            new_config_list.append(tmp_config_list)
+        tmp_config_list = []
+
+    new_config_list = [list(chain(*each_new_config)) for each_new_config in new_config_list]
+    return new_config_list
 
 def get_noun_chunks(each_configuration):
     doc = nlp1(each_configuration)
     for chunk in doc.noun_chunks:
-        tokens = nlp2(chunk.root.text).vector
-        return tokens
+        tokens = nlp2(chunk.root.text)
+        tokens_vec = nlp2(chunk.root.text).vector
+        return (tokens.text, tokens_vec)
                 
 def get_configurations(sentence):
-    sentence_list = []
     sentence = sentence.lower().strip()
     sentence_list = sentence.split('.')
+    sentence_list = [('', " "+each_sentence+" ") for each_sentence in sentence_list]
     for each_word in dictionary:
-        for sl in sentence_list:
-            if each_word in sl:
+        for sl in list(sentence_list):
+            if each_word in sl[1]:
                 index = sentence_list.index(sl)
                 sentence_list.remove(sl)
-                temp = sl.split(each_word)
-                temp = [tt if id== 0 else each_word+tt for id,tt in enumerate(temp)]
-                for tt in temp:
-                    if tt:
-                        sentence_list.insert(index,tt)
-                        index +=1
+                tmp_word = sl[1].split(each_word)
+                for id, tt in enumerate(tmp_word):
+                    if id == 0:
+                        tmp_tuple = (sl[0], " "+ tt + " ")
+                    else:
+                        tmp_tuple = (each_word, " "+ tt + " ")
+                    sentence_list.insert(index, tmp_tuple)
+                    index += 1
+  
+    sentence_list = combine_process(sentence_list)
+    sentence_list = [' '.join(filter(None, map(str.strip, each_sentence))) for each_sentence in sentence_list]
     sentence_list = post_processing_sentence(list(filter(None,sentence_list)))
-    return sentence_list
 
+    return sentence_list
 
 def load_datasets(splits, opts=None):
     data = []
@@ -132,7 +189,7 @@ def load_datasets(splits, opts=None):
             with open('tasks/R2R-pano/data/R2R_literal_speaker_data_augmentation_paths.json') as f:
                 data += json.load(f)
         else:
-            with open('tasks/R2R-pano/data/data/R2R_%s_small.json' % split) as f:
+            with open('tasks/R2R-pano/data/data/R2R_%s.json' % split) as f:
                 data += json.load(f)
 
     return data
