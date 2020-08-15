@@ -4,7 +4,7 @@ import numpy as np
 import copy
 import math
 import os
-
+from collections import defaultdict
 import torch
 import torch.nn as nn
 import torch.distributions as D
@@ -21,7 +21,7 @@ class PanoBaseAgent(object):
         self.results_path = results_path
         random.seed(1)
         self.results = {}
-        #self.object_img_feat_path = 'tasks/R2R-pano/152-object_feature1.npy'
+        self.object_img_feat_path = 'tasks/R2R-pano/152-object_feature1.npy'
 
         self.object_feat_path = 'img_features/object_representation_glove1.npy'
         tmp_obj_feat, tmp_obj_img_feat = self.np_to_tensor(self.object_feat_path)
@@ -98,6 +98,7 @@ class PanoBaseAgent(object):
             else:
                 next_viewpoint_idx.append('STAY')
                 ended[i] = True
+           
 
             # use the available viewpoints and action to select next viewpoint
             next_viewpoints.append(viewpoints[i][action[i]])
@@ -176,7 +177,7 @@ class PanoBaseAgent(object):
             for j, viewpoint_id in enumerate(ob['navigableLocations']):
                 index_list.append(int(ob['navigableLocations'][viewpoint_id]['index']))
                 viewpoints_tmp.append(viewpoint_id)
-                heading_list.append(ob['navigableLocations'][viewpoint_id]['rel_heading'])
+                heading_list.append(ob['navigableLocations'][viewpoint_id]['heading'])
                 #next_img_feat_list.append(torch.tensor(self.features[ob['scan']+"_"+viewpoint_id]))
 
                 if viewpoint_id == gt_viewpoint_id:
@@ -235,6 +236,7 @@ class PanoBaseAgent(object):
                 temp = temp - 360      
             elif temp < 0 :
                 temp = temp + 360
+         
             features.append(self.object_feat[ob['scan']][ob['viewpoint']][temp*math.pi/180]['text_feature'])
             feature_mask.append(self.object_feat[ob['scan']][ob['viewpoint']][temp*math.pi/180]['text_mask'])
             obj_img.append(self.object_img_feat[ob['scan']][ob['viewpoint']][temp*math.pi/180]['features'])
@@ -279,25 +281,27 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
         self.episode_len = episode_len
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.atten_weight = {}
+        self.r_value = {}
+        self.navigable_viewpoint = defaultdict(dict)
         
         self.ignore_index = opts.max_navigable + 1  # we define (max_navigable+1) as ignore since 15(navigable) + 1(STOP)
         self.criterion = nn.CrossEntropyLoss(ignore_index=self.ignore_index)
 
-       # self.landmark_feature = self.get_landmark_feature()
+        self.landmark_feature = self.get_landmark_feature()
 
         self.MSELoss = nn.MSELoss()
         self.MSELoss_sum = nn.MSELoss(reduction='sum')
     
     def get_landmark_feature(self):
         landmark_dict = {}
-        landmark_dict1 = np.load('tasks/R2R-pano/landmark1.npy', allow_pickle=True).item()
-        landmark_dict2 = np.load('tasks/R2R-pano/landmark2.npy', allow_pickle=True).item()
-        landmark_dict3 = np.load('tasks/R2R-pano/landmark.npy', allow_pickle=True).item()
-        landmark_dict4 = np.load('tasks/R2R-pano/landmark_test.npy', allow_pickle=True).item()
+        landmark_dict1 = np.load('tasks/R2R-pano/new_landmark_train.npy', allow_pickle=True).item()
+        landmark_dict2 = np.load('tasks/R2R-pano/new_landmark_val_seen.npy', allow_pickle=True).item()
+        landmark_dict3 = np.load('tasks/R2R-pano/new_landmark_val_unseen.npy', allow_pickle=True).item()
+        #landmark_dict4 = np.load('tasks/R2R-pano/landmark_test.npy', allow_pickle=True).item()
         landmark_dict.update(landmark_dict1)
         landmark_dict.update(landmark_dict2)
         landmark_dict.update(landmark_dict3)
-        landmark_dict.update(landmark_dict4)
+        #landmark_dict.update(landmark_dict4)
         return landmark_dict
 
     def get_value_loss_from_start(self, traj, predicted_value, ended, norm_value=True, threshold=5):
@@ -803,6 +807,8 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
     
     def rollout_object_config(self):
         obs = np.array(self.env.reset()) # load a mini-batch
+        self.get_navigable_viewpoint(obs)
+
         batch_size = len(obs)
         token_num = 0
         split_index = []
@@ -902,7 +908,8 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
         loss = 0
         question = h_t
         
-        quan_matrix = []
+        attention_weight_matrix = []
+        r_matrix = []
         for step in range(self.opts.max_episode_len):     
             navigable_img_feat, navigable_obj_feat, navigable_obj_img_feat, object_mask, viewpoints_indices = super(PanoSeq2SeqAgent, self).obj_navigable_feat(obs, ended) # should change pano_img_feat and navigable_feat
             viewpoints, navigable_index, target_index = viewpoints_indices  
@@ -915,10 +922,11 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
              # forward
             r_t = r0 if step==0 else None
             
-            h_t, c_t, pre_ctx_attend, img_attn, ctx_attn, logit, value, navigable_mask = self.model(navigable_img_feat, navigable_obj_feat, navigable_obj_img_feat, object_mask, pre_feat, question, \
+            h_t, c_t, pre_ctx_attend, img_attn, ctx_attn, logit, value, navigable_mask, tmp_r_t = self.model(navigable_img_feat, navigable_obj_feat, navigable_obj_img_feat, object_mask, pre_feat, question, \
             h_t, c_t, ctx, pre_ctx_attend, ctx_attn, r_t, navigable_index, ctx_mask)
 
-            quan_matrix.append(ctx_attn.detach().cpu().numpy())
+            attention_weight_matrix.append(ctx_attn.detach().cpu().numpy())
+            r_matrix.append(tmp_r_t.detach().cpu().numpy())
 
             logit.data.masked_fill_((navigable_mask == 0).data, -float('inf'))
             current_logit_loss = self.criterion(logit, target)
@@ -946,6 +954,7 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
 
             # make a viewpoint change in the env
             obs = self.env.step(scan_id, next_viewpoints, next_headings)
+            self.get_navigable_viewpoint(obs)
 
             # save trajectory output and update last_recorded
             traj, last_recorded = self.update_traj(obs, traj, img_attn, ctx_attn, value, next_viewpoint_idx,
@@ -957,9 +966,12 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
             if last_recorded.all():
                 break
         
-        quan_matrix = np.stack(quan_matrix, axis=1)
-        for matrix_id, each_matrix in enumerate(quan_matrix):
-            self.atten_weight[instr_id_list[matrix_id]] = {"length":config_num_list[matrix_id], "attention_weight":each_matrix}
+        attention_weight_matrix = np.stack(attention_weight_matrix, axis=1)
+        r_matrix = np.stack(r_matrix, axis=1)
+        for matrix_atten_id, each_atten_matrix in enumerate(attention_weight_matrix):
+            self.atten_weight[instr_id_list[matrix_atten_id]] = {"length":config_num_list[matrix_atten_id], "attention_weight":each_atten_matrix}
+        for matrix_r_id, each_r_matrix in enumerate(r_matrix):
+            self.r_value[instr_id_list[matrix_r_id]] = {"length":config_num_list[matrix_r_id], "r_weight":each_r_matrix}
 
         self.dist_from_goal = [traj_tmp['distance'][-1] for traj_tmp in traj]
 
@@ -1046,6 +1058,12 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
         self.dist_from_goal = [traj_tmp['distance'][-1] for traj_tmp in traj]
 
         return loss, traj
+    
+    def get_navigable_viewpoint(self, obs):
+        for ob in obs:
+            if ob['viewpoint'] not in list(self.navigable_viewpoint[ob['scan']].keys()):
+                self.navigable_viewpoint[ob['scan']][ob['viewpoint']] = ob['navigableLocations']
+        
 
     def model_seen_step(self, tmp_obs, ended, tmp_pre_feat, tmp_h_t, tmp_c_t, tmp_ctx, tmp_ctx_mask,
                         tmp_question, tmp_pre_ctx_attend, tmp_ctx_attn, tmp_r_t):
