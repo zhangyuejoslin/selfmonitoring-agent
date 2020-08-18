@@ -849,6 +849,8 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
         instr_id_list = []
         config_num_list = []
         for ob in obs:
+            if ob['instr_id'] == "2539_2":
+                print('Quan')
             instr_id_list.append(ob['instr_id'])
             config_num_list.append(len(ob['configurations']))
             tmp_landmark_list = []
@@ -923,7 +925,7 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
             r_t = r0 if step==0 else None
             
             h_t, c_t, pre_ctx_attend, img_attn, ctx_attn, logit, value, navigable_mask, tmp_r_t = self.model(navigable_img_feat, navigable_obj_feat, navigable_obj_img_feat, object_mask, pre_feat, question, \
-            h_t, c_t, ctx, pre_ctx_attend, ctx_attn, r_t, navigable_index, ctx_mask)
+            h_t, c_t, ctx, pre_ctx_attend, ctx_attn, r_t, navigable_index, ctx_mask, step)
 
             attention_weight_matrix.append(ctx_attn.detach().cpu().numpy())
             r_matrix.append(tmp_r_t.detach().cpu().numpy())
