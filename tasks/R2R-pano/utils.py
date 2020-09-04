@@ -44,7 +44,6 @@ with open(config["stop_words_file"]) as f_stop_word:
     stopword = f_stop_word.read().split('\n')
     stopword = split_oder(stopword)
 
-
 def setup(opts, seed=1):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -53,7 +52,6 @@ def setup(opts, seed=1):
         write_vocab(build_vocab(splits=['train']), opts.train_vocab)
     if not os.path.exists(opts.trainval_vocab):
         write_vocab(build_vocab(splits=['train', 'val_seen', 'val_unseen']), opts.trainval_vocab)
-
 
 def load_nav_graphs(scans):
     """ Load connectivity graph for each scan """
@@ -156,6 +154,9 @@ def get_noun_chunks(each_configuration):
         tokens = nlp2(chunk.root.text)
         tokens_vec = nlp2(chunk.root.text).vector
         return (tokens.text, tokens_vec)
+
+def get_motion_indicator(each_configuration):
+    pass
                 
 def get_configurations(sentence):
     sentence = sentence.lower().strip()
@@ -189,7 +190,7 @@ def load_datasets(splits, opts=None):
             with open('tasks/R2R-pano/data/R2R_literal_speaker_data_augmentation_paths.json') as f:
                 data += json.load(f)
         else:
-            with open('tasks/R2R-pano/data/data/R2R_%s.json' % split) as f:
+            with open('tasks/R2R-pano/data/data/R2R_%s3.json' % split) as f:
                 data += json.load(f)
 
     return data
@@ -391,7 +392,8 @@ def resume_training(opts, model, encoder, optimizer):
     # main:experiments_20200622-044027/" + "105"
     # 80: experiments_20200620-212112/" + "105" 
     # soft atten: experiments_20200630-143113.txt
-    opts.resume = opts.checkpoint_dir + "experiments_20200630-143113/" + "105" + file_extention
+
+    opts.resume = opts.checkpoint_dir + "experiments_20200823-202908/" + "90" + file_extention
     #opts.resume = opts.checkpoint_dir + opts.exp_name + file_extention
     if os.path.isfile(opts.resume):
         if is_experiment():
