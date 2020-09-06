@@ -11,9 +11,10 @@ import math
 import base64
 import random
 import networkx as nx
+import json
 
 
-from utils import load_datasets, load_nav_graphs, print_progress, is_experiment, get_configurations, get_noun_chunks
+from utils import load_datasets, load_nav_graphs, print_progress, is_experiment, get_configurations, get_noun_chunks, get_motion_indicators
 
 csv.field_size_limit(sys.maxsize)
 
@@ -105,12 +106,16 @@ class R2RPanoBatch():
         self.opts = opts
         self.configuration = configuration
         self.landmark_noun = {}
+        self.landmark_noun_text = {}
+        self.motion_indicator = {}
+        self.gold_config = self.load_gold_config('tasks/R2R-pano/data/data/gold_data/split_configuration_gold.txt')
 
 
         print('Loading {} dataset'.format(splits[0]))
 
         json_data = load_datasets(splits)
         total_length = len(json_data)
+        num=0
 
         # iteratively load data into system memory
         for i, item in enumerate(json_data):
@@ -136,17 +141,25 @@ class R2RPanoBatch():
                 #         new_item['instr_encoding'] = item['instr_encoding']
                 if configuration:
                     new_item['configurations'] = get_configurations(instr)
-                    with open('tasks/R2R-pano/split_configuration.txt','a') as f1:
-                        pass
-
-
-                    # for config_id, each_config in enumerate(new_item['configurations']):
-                    #     if each_config == None:
-                    #         self.landmark_noun[new_item['instr_id']+"_"+ str(config_id)] = np.zeros(300)
-                    #     else:
-                    #         self.landmark_noun[new_item['instr_id']+"_"+ str(config_id)] = get_noun_chunks(each_config)
                     self.data.append((len(new_item['configurations']), new_item))
-
+                    # self.write_config(splits, new_item)
+                    #new_item['configurations'] = self.gold_config[new_item['instr_id']]
+                    
+                    # to get landmark and motion_indicator feature
+                    '''
+                    for config_id, each_config in enumerate(new_item['configurations']):
+                        #if each_config == None:
+                            #self.landmark_noun[new_item['instr_id']+"_"+ str(config_id)] = np.zeros(300)
+                            #self.motion_indicator[new_item['instr_id']+"_"+ str(config_id)] = np.zeros(300)
+                        # if get_noun_chunks(each_config) is None:
+                        #     self.landmark_noun[new_item['instr_id']+"_"+ str(config_id)] = np.zeros(300) 
+                        if get_motion_indicators(each_config) == None:
+                            print("quan") 
+                        #else:
+                            #self.landmark_noun[new_item['instr_id']+"_"+ str(config_id)] = get_noun_chunks(each_config)[1]
+                            #self.motion_indicator[new_item['instr_id']+"_"+ str(config_id)] = get_motion_indicators(each_config)[1]
+                    '''
+                    
                 else:
                     self.data.append(new_item)
 
@@ -159,9 +172,9 @@ class R2RPanoBatch():
            
             print_progress(i + 1, total_length, prefix='Progress:',
                                suffix='Complete', bar_length=50)
-
-       # np.save("tasks/R2R-pano/landmark_test.npy", self.landmark_noun)
-
+        
+        #self.write_npy(splits)
+ 
         if configuration:
             self.data.sort(key=lambda x: x[0])
             self.data = list(map(lambda item:item[1], self.data))
@@ -177,6 +190,28 @@ class R2RPanoBatch():
         self.batch_size = batch_size
         self._load_nav_graphs()
         print('R2RBatch loaded with %d instructions, using splits: %s' % (len(self.data), ",".join(splits)))
+    
+    def write_config(self, split, each_item):
+        with open(f'tasks/R2R-pano/new_split_configuration_{split[0]}.txt','a') as f_out:
+            f_out.write(each_item['instr_id']+'\n')
+            f_out.write(each_item['instructions']+'\n')
+            for each_config in each_item['configurations']:
+                f_out.write(each_config+'\n')
+            f_out.write('\n\n')
+    
+    def write_npy(self, split):
+        np.save(f"tasks/R2R-pano/data/data/component_data/landmarks/new_landmarks_feature/new1_landmark_{split[0]}.npy", self.landmark_noun)
+    
+    def load_gold_config(self, gold_file):
+        with open(gold_file) as f_config:
+            config_list = f_config.read().split('\n\n')
+
+        config_dict = {}
+        for each_config in config_list:
+            each_config = each_config.strip('\n').strip().split('\n')
+            config_dict[each_config[0]] = each_config[1:]
+        return config_dict
+        
 
     def _load_nav_graphs(self):
         """ Load connectivity graph for each scan, useful for reasoning about shortest paths """

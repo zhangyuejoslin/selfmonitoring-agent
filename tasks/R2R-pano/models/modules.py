@@ -130,6 +130,31 @@ class SoftAttention(nn.Module):
 
         return weighted_context, attn
 
+class NextSoftAttention(nn.Module):
+    """Soft-Attention without learnable parameters
+    """
+
+    def __init__(self):
+        super(NextSoftAttention, self).__init__()
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self, h, proj_context, context=None, mask=None, reverse_attn=False):
+        """Propagate h through the network.
+
+        h: batch x dim (concat(img, action))
+        context: batch x seq_len x dim
+        mask: batch x seq_len indices to be masked
+        """
+        # Get attention
+        attn = torch.matmul(h.unsqueeze(1).unsqueeze(2), proj_context.transpose(2,3)).squeeze(2)  # batch x seq_len
+        #attn = torch.ones((proj_context.shape[0], 80), device=proj_context.device)
+
+        attn = self.softmax(attn)
+      
+        weighted_context = torch.matmul(attn.unsqueeze(dim=2), proj_context).squeeze(dim=2)  # batch x dim
+
+        return weighted_context, attn
+
 
 class ScaledDotProductAttention(nn.Module):
     """Scaled Dot-Product Attention"""
@@ -165,7 +190,7 @@ class StateAttention(nn.Module):
         super(StateAttention, self).__init__()
         self.sm = nn.Softmax(dim=1)
 
-    def forward(self, a_t, r_t, input_embedding, padded_mask):
+    def forward(self, a_t, r_t, input_embedding, padded_mask, step):
         new_a_t = torch.zeros_like(a_t)
         for i in range(a_t.shape[1]):
             if i==0:
@@ -186,14 +211,20 @@ class StateAttention(nn.Module):
 #         super(StateAttention, self).__init__()
 #         self.sm = nn.Softmax(dim=1)
 
-#     def forward(self, a_t, r_t, input_embedding, padded_mask):
+#     def forward(self, a_t, r_t, input_embedding, padded_mask,step):
+#         # new_a_t = torch.zeros_like(a_t)
+#         # config_num = torch.sum(padded_mask, dim=1)
+#         # new_a_t = torch.div(padded_mask, (config_num.unsqueeze(dim=1)))
+#         # new_a_t = new_a_t.unsqueeze(dim=1)
+#         # output = torch.matmul(new_a_t, input_embedding).squeeze(dim=1)
 #         new_a_t = torch.zeros_like(a_t)
-#         config_num = torch.sum(padded_mask, dim=1)
-#         new_a_t = torch.div(padded_mask, (config_num.unsqueeze(dim=1)))
-#         #new_a_t = padded_mask / config_num
-
+#         #tmp_a_t = torch.tensor([[1,0,0],[0.955,0.045,0],[0.825,0.100,0.075],[0.400,0.525,0.075],[0.083,0.300,0.617],[0.083,0.300,0.617],[0.083,0.300,0.617],[0.083,0.300,0.617],[0.083,0.300,0.617],[0.083,0.300,0.617]])
+#         tmp_a_t = torch.tensor([[1,0,0],[0,1,0],[0,1,0],[0,1,0],[0,1,0],[0,0,1],[0,0,1],[0,0,1],[0,0,1],[0,0,1]])
+#         tmp_config_num = tmp_a_t.shape[1]
+#         new_a_t[:,:tmp_config_num] = tmp_a_t[step,:]
 #         new_a_t = new_a_t.unsqueeze(dim=1)
 #         output = torch.matmul(new_a_t, input_embedding).squeeze(dim=1)
+      
 #         return output, new_a_t.squeeze(dim=1)
 
 class ConfigObjAttention(nn.Module):
@@ -201,7 +232,7 @@ class ConfigObjAttention(nn.Module):
         super(ConfigObjAttention, self).__init__()
         self.sm = nn.Softmax(dim=2)
     
-    def forward(self, config_feature, image_feature, atten_mask):
+    def forward(self, config_feature, image_feature, atten_mask, object_mask):
         # atten: 4 x 1 x 128 
         # image_weight batch x 576 x 128
         # atten_mask batch x 16
@@ -209,15 +240,17 @@ class ConfigObjAttention(nn.Module):
         batch_size = config_feature.shape[0]
         atten_weight = config_feature.unsqueeze(dim=1) # 4 x 1 x128
         atten_weight = torch.bmm(atten_weight, torch.transpose(image_feature, 1, 2)).squeeze(dim=1)# 4 x 576
-        atten_weight = atten_weight.view(batch_size, 16, 36) # 4 x 16 x 36
-        extened_padded_mask = ((1.0 - atten_mask) * -1e9).unsqueeze(dim=2)
+        atten_weight = atten_weight.view(batch_size, 16*3, 36) # 4 x 16 x 36
+        atten_mask = atten_mask.unsqueeze(dim=2)
+        tmp_atten_object_mask = atten_mask.repeat(1,3,1) * object_mask
+        extened_padded_mask = ((1.0 - tmp_atten_object_mask) * -1e9)
         atten_weight = atten_weight + extened_padded_mask
         atten_weight = self.sm(atten_weight) # 4 x 16 x 36
         atten_weight = atten_weight.unsqueeze(dim=2)
-        image_feature = image_feature.view(batch_size, 16, 36, 128)
+        image_feature = image_feature.view(batch_size, 16*3, 36, 128)
         weighted_config_img_feat = torch.matmul(atten_weight, image_feature).squeeze(dim=2) # 4 x 16 x 1 x 128
 
-        return weighted_config_img_feat
+        return weighted_config_img_feat, atten_weight.squeeze(dim=2)
         
 class ConfigAttention(nn.Module):
     def __init__(self):
