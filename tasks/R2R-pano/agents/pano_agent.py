@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.distributions as D
 import torch.nn.functional as F
 
-from utils import padding_idx, pad_list_tensors
+from utils import padding_idx, pad_list_tensors, get_landmark
 from env import load_features
 
 class PanoBaseAgent(object):
@@ -186,7 +186,7 @@ class PanoBaseAgent(object):
         object_mask = torch.zeros(len(obs), self.opts.max_navigable*3, object_num)
         
         navigable_obj_img_feat = torch.zeros(len(obs), self.opts.max_navigable*3, object_num, feature_size2)
-        navigable_img_feat = torch.zeros(len(obs), self.opts.max_navigable, img_feature_size)
+        navigable_img_feat = torch.zeros(len(obs), self.opts.max_navigable*3, img_feature_size)
      
         next_img_feat = torch.zeros(len(obs), self.opts.max_navigable, 36, 2048)
 
@@ -198,15 +198,19 @@ class PanoBaseAgent(object):
             index_list = []
             viewpoints_tmp = []
             heading_list = []
-            next_img_feat_list = []
+            top_index_list = []
+            bottom_index_list = []
+   
             gt_viewpoint_id, viewpoint_idx = ob['gt_viewpoint_idx']
 
             for j, viewpoint_id in enumerate(ob['navigableLocations']):
-                index_list.append(int(ob['navigableLocations'][viewpoint_id]['index']))
+                bottom_index, middle_index, top_index = self.elevation_index(int(ob['navigableLocations'][viewpoint_id]['index']))
+                bottom_index_list.append(bottom_index)
+                index_list.append(middle_index)
+                top_index_list.append(top_index)
                 viewpoints_tmp.append(viewpoint_id)
                 heading_list.append(ob['navigableLocations'][viewpoint_id]['heading'])
                 #next_img_feat_list.append(torch.tensor(self.features[ob['scan']+"_"+viewpoint_id]))
-
                 if viewpoint_id == gt_viewpoint_id:
                     # if it's already ended, we label the target as <ignore>
                     if ended[i] and self.opts.use_ignore_index:
@@ -220,15 +224,21 @@ class PanoBaseAgent(object):
             #next_img_feat_list = torch.stack(next_img_feat_list[1:], dim=0)
             current_index = index_list[0]
             navi_index = index_list[1:]
+            bottom_index = bottom_index_list[1:]
+            top_index = top_index_list[1:]
             navigable_feat_index.append(navi_index)
             current_feat_index.append(current_index)
             viewpoints.append(viewpoints_tmp)
             heading_list = heading_list[1:]
-            navigable_img_feat[i, 1:len(navi_index) + 1] = pano_img_feat[i, navi_index]
+          
+            navigable_img_feat[i, 1:1+len(navi_index)] = pano_img_feat[i, bottom_index]
+            navigable_img_feat[i, 17:17+len(navi_index)] = pano_img_feat[i, navi_index]    
+            navigable_img_feat[i, 33:33+len(navi_index)] = pano_img_feat[i, top_index]
             tmp_obj_text_feat, tmp_mask, tmp_obj_img_feat = self._faster_rcnn_feature(ob, heading_list)
-            navigable_obj_text_feat[i, 1:(len(navi_index)*3+1)] =  tmp_obj_text_feat
-            object_mask[i, 1:(len(navi_index)*3+1)] = tmp_mask
-            navigable_obj_img_feat[i, 1:(len(navi_index)*3+1)] = tmp_obj_img_feat
+            self.distribute_feature(navi_index, navigable_obj_text_feat[i], tmp_obj_text_feat)
+            self.distribute_feature(navi_index, object_mask[i], tmp_mask)
+            self.distribute_feature(navi_index, navigable_obj_img_feat[i], tmp_obj_img_feat)
+
            # next_img_feat[i, 1:len(navi_index)+1] = next_img_feat_list
 
 
@@ -237,7 +247,12 @@ class PanoBaseAgent(object):
 
         #return navigable_img_feat, navigable_obj_feat, next_img_feat, (viewpoints, navigable_feat_index, target_index)
         return navigable_img_feat, navigable_obj_text_feat, navigable_obj_img_feat, object_mask, (viewpoints, navigable_feat_index, target_index, current_feat_index)
-    
+
+    def distribute_feature(self, navi_index, pre_feature, feature):
+        pre_feature[1: 1+len(navi_index)] =  feature[0*len(navi_index):1*len(navi_index)]
+        pre_feature[17:17+len(navi_index)] =  feature[1*len(navi_index):2*len(navi_index)]
+        pre_feature[33:33+len(navi_index)] =  feature[2*len(navi_index):3*len(navi_index)]
+
     
     def np_to_tensor(self, object_feat_path1):
         all_obs_obj = np.load(self.object_feat_path, allow_pickle=True).item()
@@ -254,6 +269,13 @@ class PanoBaseAgent(object):
 
         return all_obs_obj, all_obs_obj_img
     
+    def elevation_index(self, index):
+        elevation_level = index % 12
+        bottom_index = elevation_level
+        middle_index = elevation_level + 12
+        top_index = elevation_level + 12 + 12
+        return bottom_index, middle_index, top_index
+
     def np_to_tensor_new(self, object_img_feat_path):
         all_obj = np.load(object_img_feat_path, allow_pickle=True).item()
         for scan_key, scan_value in  all_obj.items():
@@ -705,7 +727,7 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
         if self.opts.arch == 'progress_aware_marker' or self.opts.arch == 'iclr_marker':
             pre_feat = torch.zeros(batch_size, self.opts.img_feat_input_dim + self.opts.tiled_len).to(self.device)
         else:
-            pre_feat = torch.zeros(batch_size, self.opts.img_feat_input_dim).to(self.device)
+            pre_feat = torch.zeros(batch_size, 3, self.opts.img_feat_input_dim).to(self.device)
 
         # Mean-Pooling over segments as previously attended ctx
         pre_ctx_attend = torch.zeros(batch_size, self.opts.rnn_hidden_size).to(self.device)
@@ -908,23 +930,26 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
         motion_indicator_list = []
         instr_id_list = []
         config_num_list = []
-        for ob in obs:
+        config_num = 15
+        landmark_num = 12
+        landmark_text_dimenstion = 300
 
+        landmark_object_feature = torch.zeros(batch_size, config_num, landmark_num, landmark_text_dimenstion).to(self.device) 
+        input_landmark_tensor = torch.zeros(batch_size, config_num, landmark_text_dimenstion).to(self.device)
+        motion_indicator_tensor = torch.zeros(batch_size, config_num, landmark_text_dimenstion).to(self.device)
+    
+        for ob_id, ob in enumerate(obs):
             instr_id_list.append(ob['instr_id'])
             config_num_list.append(len(ob['configurations']))
             tmp_landmark_list = []
             tmp_motion_indicator_list = []
             for config_id, each_config in enumerate(ob['configurations']):
-                tmp_landmark = self.landmark_feature[ob["instr_id"]+"_"+str(config_id)]
+                tmp_landmark_tuple = self.landmark_feature[ob["instr_id"]+"_"+str(config_id)]
+                tmp_landmark_tensor = torch.tensor(np.stack(list(zip(*tmp_landmark_tuple))[1], axis=0), dtype=torch.float).to(self.device)
                 tmp_motion_indicator = self.motion_indicator_feature[ob["instr_id"]+"_"+str(config_id)]
-                if tmp_landmark is None:
-                    tmp_landmark = np.zeros(300)
-                tmp_landmark_list.append(torch.tensor(tmp_landmark, dtype=torch.float))
-                tmp_motion_indicator_list.append(torch.tensor(tmp_motion_indicator, dtype=torch.float))
-            tmp_landmark_list = torch.stack(tmp_landmark_list, dim=0)
-            tmp_motion_indicator_list = torch.stack(tmp_motion_indicator_list, dim=0)
-            landmark_list.append(tmp_landmark_list)
-            motion_indicator_list.append(tmp_motion_indicator_list)
+                input_landmark_tensor[ob_id, config_id,:] = tmp_landmark_tensor[0,:]
+                motion_indicator_tensor[ob_id, config_id,:] = torch.tensor(tmp_motion_indicator,dtype=torch.float).to(self.device)
+                landmark_object_feature[ob_id, config_id, 0:len(tmp_landmark_tuple),:] = tmp_landmark_tensor
             sentence.append(" quan ".join(ob['configurations']) + " quan")
             
         tmp_ctx, h_t, c_t, tmp_ctx_mask, split_index = self.encoder(sentence, seq_lengths)
@@ -935,14 +960,11 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
        
         seq, seq_lengths = super(PanoSeq2SeqAgent, self)._sort_batch(obs)
 
-        new_ctx = torch.zeros(batch_size, 15, token_num, 512, device = tmp_ctx.device)
-        new_ctx_mask = torch.zeros(batch_size, 15, token_num, device = tmp_ctx.device)
-        new_cls = torch.zeros(batch_size, 15, 512, device = tmp_ctx.device)
-        new_cls_mask = torch.zeros(batch_size, 15, device = tmp_ctx.device)
-        landmark_tensor = torch.zeros(batch_size, 15, 300, device = tmp_ctx.device)
-        motion_indicator_tensor = torch.zeros(batch_size, 15, 300, device = tmp_ctx.device)
+        new_ctx = torch.zeros(batch_size, config_num, token_num, 512, device = tmp_ctx.device)
+        new_ctx_mask = torch.zeros(batch_size, config_num, token_num, device = tmp_ctx.device)
+        new_cls = torch.zeros(batch_size, config_num, 512, device = tmp_ctx.device)
+        new_cls_mask = torch.zeros(batch_size, config_num, device = tmp_ctx.device)
 
- 
         for ob_id, each_index_list in enumerate(split_index):
             start = 0
             for list_id, each_index in enumerate(each_index_list):
@@ -954,12 +976,7 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
                 start = end + 1
         weighted_new_ctx, attn = self.encoder.sf(new_cls, new_cls_mask, new_ctx, new_ctx_mask)
 
-        for each_id, each_config_tensor in enumerate(landmark_list):
-            landmark_tensor[each_id:,0:len(each_config_tensor),:] = each_config_tensor
-        for each_id, each_config_tensor in enumerate(motion_indicator_list):
-            motion_indicator_tensor[each_id:,0:len(each_config_tensor),:] = each_config_tensor
-
-        weighted_new_ctx = torch.cat([weighted_new_ctx, landmark_tensor, motion_indicator_tensor], dim=2)         
+        weighted_new_ctx = torch.cat([weighted_new_ctx,input_landmark_tensor, motion_indicator_tensor], dim=2)      
         ctx = weighted_new_ctx
         ctx_mask = new_cls_mask  
         s0, r0, h0, c0 = self.encoder.init_state(batch_size, max(configuration_num_list), ctx_mask)  
@@ -981,9 +998,12 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
         attention_weight_matrix = []
         r_matrix = []
         is_pause = [0]*(batch_size)
+
+
         for step in range(self.opts.max_episode_len):     
             navigable_img_feat, navigable_obj_text_feat, navigable_obj_img_feat, object_mask, viewpoints_indices = super(PanoSeq2SeqAgent, self).obj_navigable_feat(obs, ended) # should change pano_img_feat and navigable_feat
-            viewpoints, navigable_index, target_index, current_feat_index = viewpoints_indices  
+            viewpoints, navigable_index, target_index, current_feat_index = viewpoints_indices
+            _, image_num, object_num, text_dimenstion = navigable_obj_text_feat.shape
 
             navigable_img_feat = navigable_img_feat.to(self.device)
             navigable_obj_text_feat = navigable_obj_text_feat.to(self.device)
@@ -992,9 +1012,26 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
             target = torch.LongTensor(target_index).to(self.device)
              # forward
             r_t = r0 if step==0 else None
-            
+
+            #get landmark feature
+            '''
+            navigable_obj_text_feat: 4 x 48 x 36 x 300
+            landmark: 4 x 15 x 12 x 300 4x75x300
+            4 x 48 x 36 x 15 x 5
+            # landmark_similarity : 4 x 48 x 36 x 15
+            # ctx_attn: 4 x 1 x 1 x 15 -> 4 x 1 x 15 x 1
+            # weighted_landmark_similarity: 4 x 48 x 36
+            '''
+
+            landmark_object_feature = landmark_object_feature.view(batch_size, 15*12, 300)
+            landmark_similarity = torch.matmul(navigable_obj_text_feat, torch.transpose(landmark_object_feature.unsqueeze(1),3,2))
+            landmark_similarity = landmark_similarity.view(batch_size, image_num, object_num, 15, -1)
+            landmark_similarity = torch.max(landmark_similarity, dim=-1)[0]
+            weighted_landmark_similarity = torch.matmul(landmark_similarity, torch.transpose(ctx_attn.reshape(ctx_attn.shape[0],1,1,ctx_attn.shape[1]),3,2)).squeeze(-1)
+          
+
             h_t, c_t, pre_ctx_attend, img_attn, ctx_attn, logit, value, navigable_mask, tmp_r_t = self.model(navigable_img_feat, navigable_obj_text_feat, navigable_obj_img_feat, object_mask, pre_feat, question, \
-            h_t, c_t, ctx, pre_ctx_attend, ctx_attn, r_t, navigable_index, ctx_mask, step)
+            h_t, c_t, ctx, pre_ctx_attend, ctx_attn, r_t, navigable_index, ctx_mask, step, weighted_landmark_similarity)
 
             attention_weight_matrix.append(ctx_attn.detach().cpu().numpy())
             r_matrix.append(tmp_r_t.detach().cpu().numpy())
@@ -1048,7 +1085,11 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
             traj, last_recorded = self.update_traj(obs, traj, img_attn, ctx_attn, value, next_viewpoint_idx,
                                                    navigable_index, ended, last_recorded)
 
-            pre_feat = navigable_img_feat[torch.LongTensor(range(batch_size)), action,:]
+            top_pre_feat = navigable_img_feat[torch.LongTensor(range(batch_size)), action,:]
+            middle_pre_feat = navigable_img_feat[torch.LongTensor(range(batch_size)), action+12,:]
+            below_pre_feat = navigable_img_feat[torch.LongTensor(range(batch_size)), action+24,:]
+            pre_feat = top_pre_feat + middle_pre_feat + below_pre_feat 
+            #navigable_img_feat[torch.LongTensor(range(batch_size)), action,:]
 
             # Early exit if all ended
             if last_recorded.all():
