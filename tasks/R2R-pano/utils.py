@@ -27,12 +27,10 @@ base_vocab = ['<PAD>', '<START>', '<EOS>', '<UNK>']
 padding_idx = base_vocab.index('<PAD>')
 config = {
     'split_file' : 'tasks/R2R-pano/data/data/split_dictionary.txt',
+    'motion_indicator_file' : 'tasks/R2R-pano/data/data/component_data/motion_indicator/motion_dict.txt',
     'stop_words_file': 'tasks/R2R-pano/data/data/stop_words.txt'
 }
 def split_oder(dictionary):
-    #def wordlen(string):
-    #    return len(string.split())
-    #print(sorted(dictionary, key = wordlen, reverse=True))
     return sorted(dictionary, key = lambda x: len(x.split()), reverse=True)
 with open(config['split_file']) as f_dict:
     dictionary = f_dict.read().split('\n')
@@ -43,6 +41,10 @@ with open(config['split_file']) as f_dict:
 with open(config["stop_words_file"]) as f_stop_word:
     stopword = f_stop_word.read().split('\n')
     stopword = split_oder(stopword)
+with open(config['motion_indicator_file']) as f_dict:
+    motion_dict = f_dict.read().split('\n')
+    motion_dict = [each_motion.strip() for each_motion in motion_dict]
+    motion_dict = split_oder(motion_dict)
 
 def setup(opts, seed=1):
     torch.manual_seed(seed)
@@ -152,11 +154,52 @@ def get_noun_chunks(each_configuration):
     doc = nlp1(each_configuration)
     for chunk in doc.noun_chunks:
         tokens = nlp2(chunk.root.text)
-        tokens_vec = nlp2(chunk.root.text).vector
+        tokens_vec = tokens.vector
         return (tokens.text, tokens_vec)
 
-def get_motion_indicator(each_configuration):
-    pass
+def get_motion_indicators(each_configuration):
+    motion_indicator = ""
+    for each_word in motion_dict:
+        if each_word in each_configuration:
+            motion_indicator = each_word
+    if motion_indicator == '':
+        doc = nlp1(each_configuration)
+        for token_id, token in enumerate(doc):
+            try:
+                if token.pos_ == "VERB" and doc[token_id+1].pos_ == "ADP":
+                    motion_indicator = token.text + " " + doc[token_id+1].text
+                elif token.pos_ == "VERB":
+                    motion_indicator = token.text 
+                else:
+                    motion_indicator = doc[0].text    
+            except IndexError:
+                    motion_indicator = token.text  
+    motion_doc = nlp1(motion_indicator)
+    sum_list = []
+    for motion_token in motion_doc:
+        sum_list.append(nlp2(motion_token.text).vector)
+    motion_indicator_vector = np.mean(np.array(sum_list), axis=0)
+    return (motion_indicator, motion_indicator_vector)
+
+def get_landmark(each_configuration):
+    doc = nlp1(each_configuration)
+    landmark_stopwords = ['right', 'left','front','them', 'you','end','top', 'bottom','it','middle','side']
+    landmark_list =[]
+    landmark_text_list = []
+    if each_configuration in motion_dict:
+        landmark_list=[("", np.zeros(300))]
+        return landmark_list
+
+    for chunk in doc.noun_chunks:
+        landmark_text = chunk.root.text
+        landmark_vector = nlp2(landmark_text).vector
+        if landmark_text not in landmark_stopwords and landmark_text not in landmark_text_list:
+            landmark_list.append((landmark_text, landmark_vector))
+            landmark_text_list.append(landmark_text)
+    if not landmark_list:
+        landmark_list=[("", np.zeros(300))]
+    return landmark_list
+        
                 
 def get_configurations(sentence):
     sentence = sentence.lower().strip()
@@ -190,7 +233,7 @@ def load_datasets(splits, opts=None):
             with open('tasks/R2R-pano/data/R2R_literal_speaker_data_augmentation_paths.json') as f:
                 data += json.load(f)
         else:
-            with open('tasks/R2R-pano/data/data/R2R_%s3.json' % split) as f:
+            with open('tasks/R2R-pano/data/data/R2R_%s.json' % split) as f:
                 data += json.load(f)
 
     return data
