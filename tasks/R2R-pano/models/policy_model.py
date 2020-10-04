@@ -440,7 +440,7 @@ class ConfiguringObject(nn.Module):
         self.proj_navigable_obj_mlp = build_mlp(**proj_navigable_obj_kwargs)
 
         proj_navigable_img_kwargs = {
-            'input_dim': img_feat_input_dim,
+            'input_dim': img_feat_input_dim + 36,
             'hidden_dims': img_fc_dim,
             'use_batchnorm': img_fc_use_batchnorm,
             'dropout': img_dropout,
@@ -449,15 +449,16 @@ class ConfiguringObject(nn.Module):
         }
         self.proj_navigable_img_mlp = build_mlp(**proj_navigable_img_kwargs)
 
-        proj_navigable_next_img_kwargs = {
-            'input_dim': 2048,
+        proj_navigable_img_kwargs2 = {
+            'input_dim': img_feat_input_dim,
             'hidden_dims': img_fc_dim,
             'use_batchnorm': img_fc_use_batchnorm,
             'dropout': img_dropout,
             'fc_bias': fc_bias,
             'relu': opts.mlp_relu
         }
-        self.proj_navigable_next_img_mlp = build_mlp(**proj_navigable_next_img_kwargs)
+        self.proj_navigable_img_mlp2 = build_mlp(**proj_navigable_img_kwargs2)
+
 
         self.h0_fc = nn.Linear(rnn_hidden_size, img_fc_dim[-1], bias=False)
         self.next_h0_fc = nn.Linear(256, 128, bias=False)
@@ -516,7 +517,7 @@ class ConfiguringObject(nn.Module):
 
 
     def forward(self, navigable_img_feat, navigable_obj_feat, navigable_obj_img_feat, object_mask, pre_feat, question, h_0, c_0, ctx, pre_ctx_attend, \
-                s_0, r_t, navigable_index, ctx_mask, step):
+                s_0, r_t, navigable_index, ctx_mask, step, landmark_similarity):
 
         """ Takes a single step in the decoder LSTM.
         config_embedding: batch x max_config_len x config embeddding
@@ -532,22 +533,26 @@ class ConfiguringObject(nn.Module):
         batch_size, num_heading, num_object, object_feat_dim = navigable_obj_feat.size()
 
         navigable_obj_feat = navigable_obj_feat.view(batch_size, num_heading*num_object, object_feat_dim) #4 x 16*36 x 300
-        navigable_obj_img_feat =  navigable_obj_img_feat.view(batch_size, num_heading*num_object, 152) # 4 x 48*36 x 152
+        navigable_obj_img_feat = navigable_obj_img_feat.view(batch_size, num_heading*num_object, 152) # 4 x 48*36 x 152
 
         index_length = [len(_index)+1 for _index in navigable_index]
         
         navigable_mask = create_mask(batch_size, self.max_navigable, index_length)
+
         navigable_obj_mask = create_mask_for_object(batch_size, self.max_navigable*3*num_object, index_length) #batch x 48*36
         
         #obj_img_feat = torch.cat([navigable_obj_feat, navigable_obj_img_feat], dim=2)
         #proj_navigable_obj_feat = proj_masking(obj_img_feat, self.proj_navigable_obj_mlp, navigable_obj_mask)
         proj_navigable_obj_feat = proj_masking(navigable_obj_img_feat, self.proj_navigable_obj_mlp, navigable_obj_mask) # batch x 48*36 x 152 -> batch x 48*36 x 128
-        
-        proj_navigable_feat = proj_masking(navigable_img_feat, self.proj_navigable_img_mlp, navigable_mask)
-        proj_pre_feat = self.proj_navigable_img_mlp(pre_feat)
+        proj_navigable_feat = proj_masking(torch.cat([navigable_img_feat, torch.sort(landmark_similarity, dim=-1)[0]],2), self.proj_navigable_img_mlp, navigable_mask.repeat(1,3)) # batch x 48 x 128
+        #proj_navigable_feat = proj_masking(torch.cat([navigable_img_feat, landmark_similarity],2), self.proj_navigable_img_mlp, navigable_mask.repeat(1,3))
+        # landmark_similarity: 4 x 48 x 36
+        # navigable_img_feat: 4 x 48 x 2176  
+                                                                             
+        proj_pre_feat = self.proj_navigable_img_mlp2(pre_feat)
 
         # weighted_img_feat, img_attn = self.soft_attn(self.h0_fc(h_0), self.next_h0_fc(torch.cat([next_weighted_img_feat, proj_navigable_feat], dim=2)), mask=navigable_mask)
-        weighted_img_feat, img_attn = self.soft_attn(self.h0_fc(h_0), proj_navigable_feat, mask=navigable_mask)
+        weighted_img_feat, img_attn = self.soft_attn(self.h0_fc(h_0), proj_navigable_feat, mask=navigable_mask.repeat(1,3))
        # weighted_obj_feat, obj_attn = self.soft_attn(self.h0_fc(h_0), proj_navigable_obj_feat, mask=navigable_obj_mask) # batch x 128
 
         if r_t is None:
@@ -565,8 +570,8 @@ class ConfiguringObject(nn.Module):
 
         conf_obj_feat, conf_obj_attn = self.config_obj_attention(self.config_fc(weighted_ctx), proj_navigable_obj_feat, navigable_mask, object_mask) # 4 x 16 x 128
         weighted_conf_obj_feat, conf_obj_attn = self.soft_attn(self.h0_fc(h_0), conf_obj_feat, mask=navigable_mask.repeat(1,3)) # 4 x 128
-        conf_obj_attn = conf_obj_attn[:,0:16] + conf_obj_attn[:,16:32] + conf_obj_attn[:,32:48]
-        new_weighted_img_feat = torch.bmm(conf_obj_attn.unsqueeze(dim=1), self.image_linear(navigable_img_feat)).squeeze(dim=1)# batch x 2176
+        #conf_obj_attn = conf_obj_attn[:,0:16] + conf_obj_attn[:,16:32] + conf_obj_attn[:,32:48]
+        new_weighted_img_feat = torch.bmm(conf_obj_attn.unsqueeze(dim=1), self.image_linear(navigable_img_feat)).squeeze(dim=1)# batch x 128
 
         # obj_attn = obj_attn.view(batch_size, num_heading, num_object) # batch x 36 x 16
         # obj_attn = torch.sum(obj_attn, dim=2) # batch x 16
@@ -580,6 +585,12 @@ class ConfiguringObject(nn.Module):
         # policy network
         h_tilde = self.logit_fc(torch.cat((weighted_ctx, h_1_drop), dim=1))
         logit = torch.bmm(proj_navigable_feat, h_tilde.unsqueeze(2)).squeeze(2)
+        logit = logit[:,0:16] + logit[:,16:32] + logit[:,32:48]
+
+
+        # how to change logit here
+
+
 
         # value estimation
         concat_value_input = self.h2_fc_lstm(torch.cat((h_0, weighted_img_feat), 1))
