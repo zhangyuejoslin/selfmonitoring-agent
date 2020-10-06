@@ -440,7 +440,8 @@ class ConfiguringObject(nn.Module):
         self.proj_navigable_obj_mlp = build_mlp(**proj_navigable_obj_kwargs)
 
         proj_navigable_img_kwargs = {
-            'input_dim': img_feat_input_dim + 36,
+            #'input_dim': img_feat_input_dim + 36,
+            'input_dim': img_feat_input_dim,
             'hidden_dims': img_fc_dim,
             'use_batchnorm': img_fc_use_batchnorm,
             'dropout': img_dropout,
@@ -473,7 +474,9 @@ class ConfiguringObject(nn.Module):
 
         self.dropout = nn.Dropout(p=rnn_dropout)
         
-        self.lstm = nn.LSTMCell(img_fc_dim[-1] * 2 + rnn_hidden_size + 300 + 300, rnn_hidden_size)
+        #self.lstm = nn.LSTMCell(img_fc_dim[-1] * 2 + rnn_hidden_size + 300 + 300, rnn_hidden_size)
+
+        self.lstm = nn.LSTMCell(img_fc_dim[-1] * 2 + rnn_hidden_size + 300, rnn_hidden_size)
 
 
         self.h1_fc = nn.Linear(rnn_hidden_size, rnn_hidden_size, bias=False)
@@ -485,13 +488,15 @@ class ConfiguringObject(nn.Module):
         self.state_attention = StateAttention()
 
 
-        self.logit_fc = nn.Linear(rnn_hidden_size * 2 + 300 + 300, img_fc_dim[-1])
+       # self.logit_fc = nn.Linear(rnn_hidden_size * 2 + 300 + 300, img_fc_dim[-1])
+        self.logit_fc = nn.Linear(rnn_hidden_size * 2 + 300, img_fc_dim[-1])
 
         self.r_linear = nn.Linear(rnn_hidden_size + 128, 2)
 
         self.image_linear = nn.Linear(img_feat_input_dim, img_fc_dim[-1])
 
-        self.config_fc = nn.Linear(512+300+300, 128, bias=False)
+       # self.config_fc = nn.Linear(512+300+300, 128, bias=False)
+        self.config_fc = nn.Linear(512+300, 128, bias=False)
 
         self.config_atten_linear = nn.Linear(512, 128)
         #self.config_atten_linear = nn.Linear(768, 128)
@@ -544,12 +549,17 @@ class ConfiguringObject(nn.Module):
         #obj_img_feat = torch.cat([navigable_obj_feat, navigable_obj_img_feat], dim=2)
         #proj_navigable_obj_feat = proj_masking(obj_img_feat, self.proj_navigable_obj_mlp, navigable_obj_mask)
         proj_navigable_obj_feat = proj_masking(navigable_obj_img_feat, self.proj_navigable_obj_mlp, navigable_obj_mask) # batch x 48*36 x 152 -> batch x 48*36 x 128
-        proj_navigable_feat = proj_masking(torch.cat([navigable_img_feat, torch.sort(landmark_similarity, dim=-1)[0]],2), self.proj_navigable_img_mlp, navigable_mask.repeat(1,3)) # batch x 48 x 128
+        
+        # not add similarity
+        proj_navigable_feat = proj_masking(navigable_img_feat, self.proj_navigable_img_mlp, navigable_mask.repeat(1,3))
+
+        # add similarity with two methods
+        #proj_navigable_feat = proj_masking(torch.cat([navigable_img_feat, torch.sort(landmark_similarity, dim=-1)[0]],2), self.proj_navigable_img_mlp, navigable_mask.repeat(1,3)) # batch x 48 x 128
         #proj_navigable_feat = proj_masking(torch.cat([navigable_img_feat, landmark_similarity],2), self.proj_navigable_img_mlp, navigable_mask.repeat(1,3))
         # landmark_similarity: 4 x 48 x 36
         # navigable_img_feat: 4 x 48 x 2176  
                                                                              
-        proj_pre_feat = self.proj_navigable_img_mlp2(pre_feat)
+        proj_pre_feat = self.proj_navigable_img_mlp(pre_feat)
 
         # weighted_img_feat, img_attn = self.soft_attn(self.h0_fc(h_0), self.next_h0_fc(torch.cat([next_weighted_img_feat, proj_navigable_feat], dim=2)), mask=navigable_mask)
         weighted_img_feat, img_attn = self.soft_attn(self.h0_fc(h_0), proj_navigable_feat, mask=navigable_mask.repeat(1,3))
@@ -586,17 +596,11 @@ class ConfiguringObject(nn.Module):
         h_tilde = self.logit_fc(torch.cat((weighted_ctx, h_1_drop), dim=1))
         logit = torch.bmm(proj_navigable_feat, h_tilde.unsqueeze(2)).squeeze(2)
         logit = logit[:,0:16] + logit[:,16:32] + logit[:,32:48]
-
-
         # how to change logit here
-
-
 
         # value estimation
         concat_value_input = self.h2_fc_lstm(torch.cat((h_0, weighted_img_feat), 1))
-
         h_1_value = self.dropout(torch.sigmoid(concat_value_input) * torch.tanh(c_1))
-
         value = self.critic(torch.cat((ctx_attn, h_1_value), dim=1))
     
         return h_1, c_1, weighted_ctx, conf_obj_attn, ctx_attn, logit, value, navigable_mask, r_t

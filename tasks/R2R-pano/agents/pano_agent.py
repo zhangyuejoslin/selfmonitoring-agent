@@ -190,7 +190,7 @@ class PanoBaseAgent(object):
      
         next_img_feat = torch.zeros(len(obs), self.opts.max_navigable, 36, 2048)
 
-
+        navigable_object_text = []
 
         navigable_feat_index, target_index, viewpoints, current_feat_index = [], [], [], []
         for i, ob in enumerate(obs):
@@ -239,14 +239,7 @@ class PanoBaseAgent(object):
             self.distribute_feature(navi_index, object_mask[i], tmp_mask)
             self.distribute_feature(navi_index, navigable_obj_img_feat[i], tmp_obj_img_feat)
 
-           # next_img_feat[i, 1:len(navi_index)+1] = next_img_feat_list
-
-
-            # tmp_img_feat = pano_img_feat[i, navi_index][:,-128:].unsqueeze(dim=1).repeat(1,36,1)
-            # navigable_obj_feat[i, 1:len(navi_index) + 1] = torch.cat([self._faster_rcnn_feature(ob, heading_list), tmp_img_feat], dim=-1)
-
-        #return navigable_img_feat, navigable_obj_feat, next_img_feat, (viewpoints, navigable_feat_index, target_index)
-        return navigable_img_feat, navigable_obj_text_feat, navigable_obj_img_feat, object_mask, (viewpoints, navigable_feat_index, target_index, current_feat_index)
+        return navigable_img_feat, navigable_obj_text_feat, navigable_obj_img_feat, object_mask, navigable_object_text, (viewpoints, navigable_feat_index, target_index, current_feat_index)
 
     def distribute_feature(self, navi_index, pre_feature, feature):
         pre_feature[1: 1+len(navi_index)] =  feature[0*len(navi_index):1*len(navi_index)]
@@ -291,7 +284,9 @@ class PanoBaseAgent(object):
         obj_img_feature = []
         obj_text_feature = []
         obj_mask = []
+        object_text = []
         elevation_list = [30*math.pi/180, 0*math.pi/180, -30*math.pi/180]
+
         for elevation in elevation_list:
             for heading in heading_list:
                 temp = int(round((heading*180/math.pi)/30) * 30)
@@ -302,6 +297,7 @@ class PanoBaseAgent(object):
                 obj_text_feature.append(self.obj_feat[ob['scan']][ob['viewpoint']][str(temp*math.pi/180)+'_'+ str(elevation)]['text_feature'])
                 obj_mask.append(self.obj_feat[ob['scan']][ob['viewpoint']][str(temp*math.pi/180)+'_'+ str(elevation)]['text_mask'])
                 obj_img_feature.append(self.obj_feat[ob['scan']][ob['viewpoint']][str(temp*math.pi/180)+'_'+ str(elevation)]['features'])
+            
           
             # except KeyError:
             #     features.append(torch.zeros(36, 300))
@@ -357,6 +353,9 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
 
         self.MSELoss = nn.MSELoss()
         self.MSELoss_sum = nn.MSELoss(reduction='sum')
+
+        self.correct_num = 0
+        self.total_num = 0
     
     def get_landmark_feature(self):
         landmark_dict = {}
@@ -976,7 +975,8 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
                 start = end + 1
         weighted_new_ctx, attn = self.encoder.sf(new_cls, new_cls_mask, new_ctx, new_ctx_mask)
 
-        weighted_new_ctx = torch.cat([weighted_new_ctx,input_landmark_tensor, motion_indicator_tensor], dim=2)      
+        #weighted_new_ctx = torch.cat([weighted_new_ctx,input_landmark_tensor, motion_indicator_tensor], dim=2)     
+        weighted_new_ctx = torch.cat([weighted_new_ctx, motion_indicator_tensor], dim=2)    
         ctx = weighted_new_ctx
         ctx_mask = new_cls_mask  
         s0, r0, h0, c0 = self.encoder.init_state(batch_size, max(configuration_num_list), ctx_mask)  
@@ -1001,9 +1001,10 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
 
 
         for step in range(self.opts.max_episode_len):     
-            navigable_img_feat, navigable_obj_text_feat, navigable_obj_img_feat, object_mask, viewpoints_indices = super(PanoSeq2SeqAgent, self).obj_navigable_feat(obs, ended) # should change pano_img_feat and navigable_feat
+            navigable_img_feat, navigable_obj_text_feat, navigable_obj_img_feat, object_mask, gold_object_text_list, viewpoints_indices = super(PanoSeq2SeqAgent, self).obj_navigable_feat(obs, ended) # should change pano_img_feat and navigable_feat
             viewpoints, navigable_index, target_index, current_feat_index = viewpoints_indices
             _, image_num, object_num, text_dimenstion = navigable_obj_text_feat.shape
+
 
             navigable_img_feat = navigable_img_feat.to(self.device)
             navigable_obj_text_feat = navigable_obj_text_feat.to(self.device)
@@ -1022,13 +1023,13 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
             # ctx_attn: 4 x 1 x 1 x 15 -> 4 x 1 x 15 x 1
             # weighted_landmark_similarity: 4 x 48 x 36
             '''
-
-            landmark_object_feature = landmark_object_feature.view(batch_size, 15*12, 300)
-            landmark_similarity = torch.matmul(navigable_obj_text_feat, torch.transpose(landmark_object_feature.unsqueeze(1),3,2))
-            landmark_similarity = landmark_similarity.view(batch_size, image_num, object_num, 15, -1)
+            
+            landmark_object_feature = landmark_object_feature.view(batch_size, 15*12, 300) #batch * 180 * 300
+            landmark_similarity = torch.matmul(navigable_obj_text_feat, torch.transpose(landmark_object_feature.unsqueeze(1),3,2))# (4*48*36*300) * (4*1*300*180）-> 4 * 48 * 36*180
+            landmark_similarity = landmark_similarity.view(batch_size, image_num, object_num, 15, -1) # 4 * 48 * 36 * 15 * 12
             landmark_similarity = torch.max(landmark_similarity, dim=-1)[0]
             weighted_landmark_similarity = torch.matmul(landmark_similarity, torch.transpose(ctx_attn.reshape(ctx_attn.shape[0],1,1,ctx_attn.shape[1]),3,2)).squeeze(-1)
-          
+           
 
             h_t, c_t, pre_ctx_attend, img_attn, ctx_attn, logit, value, navigable_mask, tmp_r_t = self.model(navigable_img_feat, navigable_obj_text_feat, navigable_obj_img_feat, object_mask, pre_feat, question, \
             h_t, c_t, ctx, pre_ctx_attend, ctx_attn, r_t, navigable_index, ctx_mask, step, weighted_landmark_similarity)
