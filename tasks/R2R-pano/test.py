@@ -5,6 +5,7 @@ import math
 from itertools import chain
 import spacy
 from collections import defaultdict
+from tqdm import tqdm
 # from itertools import chain
 
 
@@ -347,7 +348,7 @@ def get_motion_dict(test_sentence):
 
     return motion_indicator
 
-def get_motion_indicator2(test_sentence, split_dict):
+def get_motion_indicator2(test_sentence):
     motion_indicator = ""
     motion_indicator_dict = {}
     doc = nlp(test_sentence)
@@ -357,111 +358,217 @@ def get_motion_indicator2(test_sentence, split_dict):
         if motion_token.pos_ == "VERB":
             tmp_motion_token = motion_token.text
             left_tokens = list(reversed(doc[motion_token_id+1:motion_token_id + window]))
-            for left_id, left_token in enumerate(left_tokens):
-                if left_token.text in postion_list:
-                    last_token_id = len(left_tokens)-left_id +1
-                    tmp_position_token = left_token.text
-                    motion_indicator = " ".join([each_m.text for each_m in doc[motion_token_id:len(left_tokens)-left_id +1]])
-                    tmp_motion_indicator = motion_indicator
-            if motion_indicator in motion_dict:
-                motion_indicator_dict['motion'] = tmp_motion_token
-                motion_indicator_dict['direction'] = tmp_position_token
-                motion_indicator_dict['motion_indcator'] = tmp_motion_indicator
-                try:
-                    if doc[last_token_id].pos_ == "ADP":
-                        motion_indicator_dict['spatial_indicator'] = doc[last_token_id].text
-                except IndexError:
-                    print("quan")
+            if not left_tokens:
+                motion_indicator_dict['motion'] = motion_token.text
+                motion_indicator_dict['motion_indcator'] = motion_token.text
             else:
-                if left_tokens[-1].pos_ == 'ADP':
-                    motion_indicator = motion_token.text + " " + left_tokens[-1].text
-                    motion_indicator_dict['motion'] = motion_token.text
-                    motion_indicator_dict['motion_indcator'] = motion_indicator
-                    motion_indicator_dict['spatial_indicator'] = left_tokens[-1].text
+                for left_id, left_token in enumerate(left_tokens):
+                    if left_token.text in postion_list:
+                        last_token_id = len(left_tokens)-left_id +1
+                        tmp_position_token = left_token.text
+                        motion_indicator = " ".join([each_m.text for each_m in doc[motion_token_id:len(left_tokens)-left_id +1]])
+                        tmp_motion_indicator = motion_indicator
+                if motion_indicator in motion_dict:
+                    
+                    motion_indicator_dict['motion'] = tmp_motion_token
+                    motion_indicator_dict['direction'] = tmp_position_token
+                    motion_indicator_dict['motion_indcator'] = tmp_motion_indicator
+                    try:
+                        if doc[last_token_id].pos_ == "ADP":
+                            motion_indicator_dict['spatial_indicator'] = doc[last_token_id].text
+                    except IndexError:
+                        continue
+                        # print("quan")
                 else:
-                    motion_indicator = motion_token.text
-                    motion_indicator_dict['motion_indcator'] = motion_indicator          
+                    if left_tokens[-1].pos_ == 'ADP':
+                        motion_indicator = motion_token.text + " " + left_tokens[-1].text
+                        motion_indicator_dict['motion'] = motion_token.text
+                        motion_indicator_dict['motion_indcator'] = motion_indicator
+                        motion_indicator_dict['spatial_indicator'] = left_tokens[-1].text
+                    else:
+                        motion_indicator = motion_token.text
+                        motion_indicator_dict['motion_indcator'] = motion_indicator          
 
-            if motion_indicator == '':
-                motion_indicator = doc[0].text
-            break
-    return motion_indicator
+                if motion_indicator == '':
+                    motion_indicator = doc[0].text
+                break
+
+    return motion_indicator_dict
+
+def check_contain(check_word, check_dictionary, contain_stop=False):
+    check_word = check_word.strip()
+    if contain_stop:
+        connect_not_list = ['and', 'and then', 'or']
+        for e_not in connect_not_list:
+            if e_not in check_word:
+                return False
+    for each_c_d in check_dictionary:
+        if each_c_d in check_word:
+            return True
 
 
-def get_landmark2(test_sentence, split_dict):
-    test_sentence = "wait on the first landing by the banister"
+def get_landmark2(test_sentence): # "and" “of” are not processed yet
+    #test_sentence = "wait on the first landing by the banister"
+    #test_sentence = "go down the stairs to the bottom of the first landing"
+    #test_sentence = "stop by the latticework inside the house directly in front of the door"
+    #test_sentence = "stand in front of the dining table on the bench side"
+    #test_sentence = "walk through doorway just right of the portraits of a family"
+    #test_sentence = "head straight until you pass the wall with holes in it"
+    #test_sentence = "wait by the glass table with the white chairs"
+    #test_sentence = "stopping at the picture with prayer on it"
+    #test_sentence = "enter the house by the larger doorway with the two glass doors"
+    #test_sentence = "walk passed the sink and stove area"
+    #test_sentence = "stop between the refrigerator and dining table"
+    #test_sentence = "walk past the bench and then past the island"
     doc = nlp(test_sentence)
     window = 5
+    start_id = 0
+    start_end_id = 0
+    end_id = 0
     landmark_stopwords = ['right', 'left','front','them', 'you','end','top', 'bottom','it','middle','side']
     connect_list = ['with','by','of','on']
+   
     landmark_list =[]
     new_none_chunks = []
     if test_sentence in motion_dict:
         #landmark_list.append(('', np.zeros(300)))
         landmark_list = []
-        return landmark_list
+        landmark_triplet = []
+        return landmark_list, landmark_triplet
     else:
         #check whether two landmarks could be combined together
         noun_chunks = list(doc.noun_chunks)
-        for e_c_id, each_chunk in enumerate(noun_chunks):
+        noun_chunks = [each_chunk for each_chunk in noun_chunks if each_chunk.text not in landmark_stopwords]
+        for e_c_id, each_chunk in enumerate(noun_chunks):  
             between_token_list = []
-            tmp_chunks = []
-            if e_c_id + 1 < len(noun_chunks):
-                for e_t_id, each_token in enumerate(doc):
-                    if doc[e_t_id:e_t_id+1].start_char == each_chunk.start_char:
-                        start_id = e_t_id
-                    
-                    if doc[e_t_id:e_t_id+1].end_char == noun_chunks[e_c_id+1].end_char:
+            
+            for e_t_id, each_token in enumerate(doc):
+                if doc[e_t_id:e_t_id+1].start_char == each_chunk.start_char: #begin start
+                    start_id = e_t_id
+
+                if doc[e_t_id:e_t_id+1].end_char == each_chunk.end_char: #begin end
+                    start_end_id = e_t_id
+
+                if e_c_id + 1 < len(noun_chunks):
+                    if doc[e_t_id:e_t_id+1].end_char == noun_chunks[e_c_id+1].end_char:# next end
                         end_id = e_t_id
-                    
+
                     if doc[e_t_id:e_t_id+1].end_char > each_chunk.end_char and doc[e_t_id:e_t_id+1].start_char < noun_chunks[e_c_id+1].start_char:
                         between_token_list.append(each_token.text)
-                if  " ".join(between_token_list) in connect_list:
-                    new_none_chunks.append((doc[start_id: end_id+1],([each_chunk.root.text, noun_chunks[e_c_id+1].root.text])))
-                    break
-                
-                if each_chunk not in tmp_chunks:
-                    tmp_chunks.append(each_chunk)
-                    new_none_chunks.append((each_chunk, [each_chunk.root.text]))
-
-            elif e_c_id + 1 == len(noun_chunks):
-                if tmp_chunks and each_chunk in tmp_chunks:
-                    continue
+                        
+                        
+                # to process the last chunk
                 else:
-                    new_none_chunks.append((each_chunk, [each_chunk.root.text]))
-            else:
-                break
-            
-        
-        landmark_count = 0 
-        for each_n_n_c, landmark_root in new_none_chunks:
-            landmark_dict = {}
-            landmark_dict['landmarks'] = {}
-            for e_t_id, each_token in enumerate(doc):
-                landmark_dict['landmarks']['text'] = each_n_n_c.text
-                
-                landmark_dict['landmark_root'] = landmark_root
+                    if not new_none_chunks:
+                        if start_id and start_end_id:
+                            new_none_chunks.append(((e_c_id, start_id, each_chunk), None, (e_c_id, start_end_id, each_chunk)))
+                            break
+                    else:
+                        if e_c_id != new_none_chunks[-1][-1][0]:
+                            if start_id and start_end_id:
+                                new_none_chunks.append(((e_c_id, start_id, each_chunk), None, (e_c_id, start_end_id, each_chunk)))
+                                break
 
-                if doc[e_t_id:e_t_id+1].start_char == each_n_n_c.start_char:
+            if between_token_list:
+                connection_phrase = " ".join(between_token_list) 
+
+                #for the landmarks that are connected with the spatial indicators
+                if check_contain(connection_phrase, connect_list, contain_stop=True) or check_contain(connection_phrase, position_list, contain_stop=True):
+                    #for each landmark: landmark_id, start_index, landmark_text
+                    new_none_chunks.append(((e_c_id, start_id, each_chunk), connection_phrase, (e_c_id+1, end_id, noun_chunks[e_c_id+1])))
+                    
+                else:
+                    if not new_none_chunks:
+                        if start_id and start_end_id:
+                            new_none_chunks.append(((e_c_id, start_id, each_chunk), None, (e_c_id, start_end_id, each_chunk)))
+                            
+                    elif e_c_id == new_none_chunks[-1][-1][0]:
+                        continue
+                    else:
+                        if start_id and start_end_id:
+                            new_none_chunks.append(((e_c_id, start_id, each_chunk), None, (e_c_id, start_end_id, each_chunk)))
+                        
+
+            
+
+        # spatial indicator
+        tmp_new_none_chunks = []
+        tmp_chunk = []
+        for l_r_id, landmark_tuple in enumerate(new_none_chunks):
+            if not tmp_chunk:
+                tmp_chunk.append(landmark_tuple)
+            else:
+                if landmark_tuple[0][0] == tmp_chunk[-1][-1][0]:
+                    tmp_chunk.append(landmark_tuple) 
+                else:      
+                    tmp_new_none_chunks.append(tmp_chunk)
+                    tmp_chunk = []
+                    tmp_chunk.append(landmark_tuple)
+            if l_r_id == len(new_none_chunks)-1:
+                tmp_new_none_chunks.append(tmp_chunk)
+
+        # obtain spatial indicator
+        final_none_chunks = []
+        for e_l_l, landmark_list in enumerate(tmp_new_none_chunks):
+            tmp_spa_list = []
+            landmark_span = doc[landmark_list[0][0][1]:landmark_list[-1][-1][1]+1]
+            for e_t_id, each_token in enumerate(doc):
+                if doc[e_t_id:e_t_id+1].start_char == landmark_span.start_char:
                     if e_t_id - window > 0:
                         previous_tokens = list(doc[e_t_id-window:e_t_id])
                     else:
                         previous_tokens = list(doc[0:e_t_id])
-                    for p_id, p_t in enumerate(previous_tokens):
-                        if p_t.text in spatial_indicator_list:
-                            landmark_dict['spatial_indicator'] = p_t.text
 
-                if doc[e_t_id:e_t_id+1].start_char >= each_n_n_c.start_char and doc[e_t_id:e_t_id+1].end_char <= each_n_n_c.end_char: 
-                    if each_token.text in spatial_indicator_list:
-                        landmark_dict['landmarks']['spatial_indicator'] = each_token.text
-                    elif each_token.text in position_list:
-                        landmark_dict['landmarks']['sub_landmark'] = each_token.text
-            landmark_list.append(landmark_dict)
+            for p_id, p_t in enumerate(previous_tokens):
+                if p_t.text in spatial_indicator_list:
+                    tmp_spa_list.append(p_t)
+            landmark_list.append(tmp_spa_list)
+            final_none_chunks.append(landmark_list)
+        
+        # to allocate different role
+        landmark_dict = {}
+        landmark_triplet = []
+        landmark_dict['landmarks'] = []
+       
+        for e_l_l, landmark_list in enumerate(final_none_chunks):
+            each_landmark_dict = {}
+            each_landmark_dict['id'] = e_l_l
+            if not landmark_list[0][1]: 
+                each_landmark_dict['text'] = landmark_list[0][0][-1].text
+                first_text = landmark_list[0][0][-1].text
+                first_index= landmark_list[0][0][0]
+                first_start= landmark_list[0][0][1]
+                # landmark_triplet.append([first_text])
+                landmark_triplet.append((first_index, first_start, first_text))
                 
-                    
-            landmark_count += 1
-    return landmark_list
+           
+            else:
+                    tmp_sub_landmark = each_landmark_dict 
+                    for sub_id, each_sub_landmark in enumerate(landmark_list[:-1]):
+                            tmp_sub_landmark['sub_landmark'] = {}
+                            tmp_sub_landmark = tmp_sub_landmark['sub_landmark'] 
+                            tmp_sub_landmark['text'] = each_sub_landmark[-1][-1].text
+                            tmp_sub_landmark['spatial_indicator'] = each_sub_landmark[1]
 
+                            first_text = each_sub_landmark[0][-1].text
+                            first_index= each_sub_landmark[0][0]
+                            first_start= each_sub_landmark[0][1]
+
+                            second_text = each_sub_landmark[-1][-1].text
+                            second_index = each_sub_landmark[-1][0]
+                            second_start = each_sub_landmark[-1][1]
+
+                            landmark_triplet.append(((first_index, first_start,first_text), each_sub_landmark[1],(second_index, second_start, second_text)))
+                            #landmark_triplet.append((first_text, each_sub_landmark[1], second_text))
+                    each_landmark_dict['text'] = landmark_list[0][0][-1].text
+
+            if landmark_list[-1]:
+
+                    spatial_list = [spa_token.text for spa_token in landmark_list[-1]]
+                    each_landmark_dict['spatial_indicator'] = ",".join(spatial_list)
+            landmark_dict['landmarks'].append(each_landmark_dict)
+        
+        return landmark_dict, landmark_triplet
 
     
 
@@ -486,18 +593,18 @@ def get_spatial_indicator(test_sentence, landmark_list):
 
 if __name__ == "__main__":
     
-    
+    '''
     # configuration operation
     path1 = 'tasks/R2R-pano/results/experiments_20200726-202958/_val_seen_epoch_135.json'
     path2 = 'tasks/R2R-pano/data/data/R2R_val_seen.json'
     path3 = 'tasks/R2R-pano/landmark_text_val_seen.json'
     #result_compare(path1, path2, path3)
-    #config_result  = get_configurations("go down the walkway and through the screen door")
-    #print(config_result)
+    config_result  = get_configurations("Turn right, walk down hallway passed paintings,walk straight through double doors, turn left, go straight, turn left at the kitchen and stop by the refrigerator. ")
+    print(config_result)
     # gold_path = 'tasks/R2R-pano/split_configuration_gold.txt'
     # comp_path = 'tasks/R2R-pano/split_configuration_train.txt'
     # compare_config(gold_path, comp_path)
-    
+    '''
     
 
     
@@ -519,20 +626,31 @@ if __name__ == "__main__":
     
     # landmark
     
-    all_example = open("/VL/space/zhan1624/selfmonitoring-agent/tasks/R2R-pano/data/data/gold_data/split_configuration_gold.txt", "r").read()
+    all_example = open("/VL/space/zhan1624/R2R-EnvDrop/r2r_src/components/config_split.txt", "r").read()
     all_example = [each_example.strip().split('\n') for each_example in all_example.split('\n\n')]
-    final_landmarks = []
-    for each_example in all_example:
-        for each_sentence in each_example[2:]:
-            tmp_dict = {}
-            tmp_dict['sentence'] = each_sentence
-            landmark_list = get_landmark2(each_sentence, motion_dict)
-            tmp_dict['landmarks'] = landmark_list
-            final_landmarks.append(tmp_dict)
-    # with open("tasks/R2R-pano/data/data/component_data/landmarks/auto_label_landmark.json",'w') as f_l_w:
-    #     json.dump(final_landmarks, f_l_w, indent=4)
-    # print('quan')
-    
+    all_landmark_list = []
+    for each_example in tqdm(all_example[:30]):
+        for config_id, each_sentence in enumerate(each_example[2:]):
+            each_sentence = "enter a wood paneled room with a circle table in the middle"
+            tmp_landmark_dict = {}
+            # motion_indicator = get_motion_indicator2(each_sentence)
+            landmark_list, landmark_triplet = get_landmark2(each_sentence)
+            tmp_landmark_dict['instr_id'] = each_example[0]
+            tmp_landmark_dict['config_id'] = each_example[0]+"_"+str(config_id)
+            tmp_landmark_dict['sentence'] = each_example[1]
+            if landmark_triplet:
+                tmp_landmark_dict['triplets'] = landmark_triplet
+            # if motion_indicator:
+            #     tmp_landmark_dict['motion_indicator'] = motion_indicator
+            # if landmark_list:
+            #     tmp_landmark_dict['landmarks'] = landmark_list['landmarks']
+            tmp_landmark_dict['configuration'] = each_sentence
+            all_landmark_list.append(tmp_landmark_dict)
+    with open("/VL/space/zhan1624/selfmonitoring-agent/tasks/R2R-pano/data/data/component_data/landmarks/landmark_comb.json",'w') as f_l_w:
+        json.dump(all_landmark_list, f_l_w, indent=4)
+    print('aan')
+
+
    
    
     #motion_indicator dictionary
@@ -561,4 +679,30 @@ if __name__ == "__main__":
     #         if len(landmark_list) == 6:
     #             get_spatial_indicator(each_sentence, landmark_list)
 
+    #landmark_list = np.load('tasks/R2R-pano/data/data/component_data/landmarks/new_landmarks_feature/landmark_feature/landmark_train_feature.npy', allow_pickle=True).item()
+   
 
+    # statistic
+    ####### how many configuration contain landmarks
+    '''
+    all_config = []
+    with open("/VL/space/zhan1624/selfmonitoring-agent/tasks/R2R-pano/data/data/component_data/landmarks/landmark_comb.json") as f_read:
+        all_config = json.load(f_read)
+    not_landmark_num = 0
+    one_landmark_num = 0
+    
+    for each_config in all_config:
+        if "triplets" in each_config.keys():
+            if len(each_config['triplets']) == 1:
+                # if isinstance(each_config['triplets'][0][0],int):
+                    one_landmark_num += 1
+        # if "landmarks" not in each_config.keys():
+        #     not_landmark_num += 1
+        
+        # else:
+        #     if each_config['landmarks']:
+        #         not_landmark_num += 1
+    print(not_landmark_num/len(all_config))
+    print(one_landmark_num/len(all_config))
+    '''
+        
