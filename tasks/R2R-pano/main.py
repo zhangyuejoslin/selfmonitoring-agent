@@ -1,6 +1,6 @@
 import argparse
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = "1"
+os.environ['CUDA_VISIBLE_DEVICES'] = "0"
 import torch
 
 from env import R2RPanoBatch, load_features
@@ -31,7 +31,7 @@ parser.add_argument('--trainval_vocab',
                     default='tasks/R2R-pano/data/trainval_vocab.txt',
                     type=str, help='path to training and validation vocab')
 parser.add_argument('--img_feat_dir',
-                    default='img_features/ResNet-152-imagenet.tsv', #ResNet-152-imagenet.tsv' #Object-152.tsv
+                    default='/egr/research-hlr/joslin/Matterdata/v1/scans/img_features/ResNet-152-imagenet.tsv', #ResNet-152-imagenet.tsv' #Object-152.tsv
                     type=str, help='path to pre-cached image features')
 parser.add_argument('--whether_img_feat', default=1, type=int, help="whether use Resenet feature or Fasterrcnn object feature")
 
@@ -43,7 +43,7 @@ parser.add_argument('--train_iters_epoch', default=200, type=int,
                     help='number of iterations per epoch')
 parser.add_argument('--max_num_epochs', default=300, type=int,
                     help='number of total epochs to run')
-parser.add_argument('--eval_every_epochs', default=1, type=int,
+parser.add_argument('--eval_every_epochs', default=5, type=int,
                     help='how often do we eval the trained model')
 parser.add_argument('--patience', default=3, type=int,
                     help='Number of epochs with no improvement after which learning rate will be reduced.')
@@ -53,7 +53,7 @@ parser.add_argument('--seed', default=1, type=int,
                     help='random seed')
 parser.add_argument('--train_data_augmentation', default=0, type=int,
                     help='Training with the synthetic data generated with speaker')
-parser.add_argument('--epochs_data_augmentation', default=5, type=int,
+parser.add_argument('--epochs_data_augmentation', default=300, type=int,
                     help='Number of epochs for training with data augmentation first')
 
 # General model options
@@ -76,7 +76,7 @@ parser.add_argument('--teleporting', default=1, type=int,
                          'viewpoint with roughly the same heading')
 parser.add_argument('--max_episode_len', default=10, type=int,
                     help='maximum length of episode')
-parser.add_argument('--feedback_training', default='argmax', type=str,
+parser.add_argument('--feedback_training', default='sample', type=str,
                     help='options: sample | mistake | teacher (this is the feedback for training only)')
 parser.add_argument('--feedback', default='argmax', type=str,
                     help='options: sample | argmax (this is the feedback for testing only)')
@@ -88,7 +88,7 @@ parser.add_argument('--mse_sum', default=0, type=int,
                     help='when using value prediction, use MSE loss with sum or average across non-navigable directions?')
 parser.add_argument('--entropy_weight', default=0.0, type=float,
                     help='weighting for entropy loss')
-parser.add_argument('--fix_action_ended', default=0, type=int,
+parser.add_argument('--fix_action_ended', default=1, type=int,
                     help='Action set to 0 if ended. This prevent the model keep getting loss from logit after ended')
 parser.add_argument('--monitor_sigmoid', default=0, type=int,
                     help='Use Sigmoid function for progress monitor instead of Tanh')
@@ -116,8 +116,8 @@ parser.add_argument('--rnn_hidden_size', default=512, type=int)
 parser.add_argument('--bidirectional', default=0, type=int)
 parser.add_argument('--rnn_num_layers', default=1, type=int)
 parser.add_argument('--rnn_dropout', default=0.5, type=float)
-parser.add_argument('--max_cap_length', default=120, type=int, help='maximum length of captions')
-parser.add_argument('--use_configuration', default=True, help='configuration of sentence are splitted')
+parser.add_argument('--max_cap_length', default=240, type=int, help='maximum length of captions')
+parser.add_argument('--use_configuration', default=False, help='configuration of sentence are splitted')
 
 # Evaluation options
 parser.add_argument('--eval_only', default=0, type=int,
@@ -146,6 +146,41 @@ parser.add_argument('--tensorboard', default=1, type=int,
 parser.add_argument('--log_dir',
                     default='tensorboard_logs/pano-seq2seq',
                     type=str, help='path to tensorboard log files')
+
+# landmakrs
+parser.add_argument('--train_landmark_dir',
+                    default='tasks/R2R-pano/data/data/component_data/landmarks/new_landmarks_feature/landmark_feature/landmark_train_feature.npy',
+                    #default='tasks/R2R-pano/data/data/component_data/landmarks/synthetic/landmark_synthetic_feature.npy',
+                    type=str, help='pre-trained train landmark features')
+parser.add_argument('--val_seen_landmark_dir',
+                    #default='tasks/R2R-pano/data/data/component_data/landmarks/new_landmarks_feature/landmark_feature/landmark_val_seen_feature.npy',
+                    default="tasks/R2R-pano/data/data/component_data/landmarks/new_landmarks_feature/landmark_val_seen_feature1.npy",
+                    type=str, help='pre-trained val_seen landmark features')
+parser.add_argument('--val_unseen_landmark_dir',
+                    default='tasks/R2R-pano/data/data/component_data/landmarks/new_landmarks_feature/landmark_feature/landmark_val_unseen_feature.npy',
+                    type=str, help='pre-trained val_unseen landmark features')
+parser.add_argument('--test_landmark_dir',
+                    default='tasks/R2R-pano/data/data/component_data/landmarks/synthetic/landmark_test.npy',
+                    type=str, help='pre-trained test landmark features')
+
+#motion_indicator
+parser.add_argument('--train_motion_indicator_dir',
+                    default='tasks/R2R-pano/data/data/component_data/motion_indicator/motion_feature/motion_train.npy',
+                    #default = 'tasks/R2R-pano/data/data/component_data/motion_indicator/synthetic/motion_synthetic.npy',
+                    type=str, help='pre-trained train motion_indicator features')
+parser.add_argument('--val_seen_motion_indicator_dir',
+                    #default='tasks/R2R-pano/data/data/component_data/motion_indicator/motion_feature/motion_val_seen.npy',
+                    default="tasks/R2R-pano/data/data/component_data/motion_indicator/synthetic/motion_val_seen_1.npy",
+                    type=str, help='pre-trained val_seen motion_indicator features')
+parser.add_argument('--val_unseen_motion_indicator_dir',
+                    default='tasks/R2R-pano/data/data/component_data/motion_indicator/motion_feature/motion_val_unseen.npy',
+                    type=str, help='pre-trained val_unseen motion_indicator features')
+
+parser.add_argument('--test_motion_indicator_dir',
+                    default='tasks/R2R-pano/data/data/component_data/motion_indicator/synthetic/motion_test.npy',
+                    type=str, help='pre-trained val_unseen motion_indicator features')
+
+
 
 def main(opts):
 
@@ -245,7 +280,7 @@ def main(opts):
                                  splits=['train'], tokenizer=tok, configuration=opts.use_configuration)
     else:
         train_env = R2RPanoBatch(opts, feature, img_spec, batch_size=opts.batch_size, seed=opts.seed,
-                                 splits=['synthetic'], tokenizer=tok)
+                                 splits=['synthetic'], tokenizer=tok, configuration=opts.use_configuration)
 
     val_envs = {split: (R2RPanoBatch(opts, feature, img_spec, batch_size=opts.batch_size,
                                      splits=[split], tokenizer=tok, configuration=opts.use_configuration), Evaluation([split]))
