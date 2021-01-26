@@ -14,7 +14,7 @@ import networkx as nx
 import json
 
 
-from utils import load_datasets, load_nav_graphs, print_progress, is_experiment, get_configurations, get_noun_chunks, get_motion_indicators
+from utils import load_datasets, load_nav_graphs, print_progress, is_experiment, get_configurations, get_noun_chunks, get_motion_indicators, get_landmark, get_new_motion_indicator
 
 csv.field_size_limit(sys.maxsize)
 
@@ -105,9 +105,12 @@ class R2RPanoBatch():
         self.scans = []
         self.opts = opts
         self.configuration = configuration
+        self.landmark = {}
         self.landmark_noun = {}
         self.landmark_noun_text = {}
         self.motion_indicator = {}
+        self.motion_indicator_dict = {}
+        self.motion_indicator_dictionary = []
         self.gold_config = self.load_gold_config('tasks/R2R-pano/data/data/gold_data/split_configuration_gold.txt')
 
 
@@ -115,7 +118,7 @@ class R2RPanoBatch():
 
         json_data = load_datasets(splits)
         total_length = len(json_data)
-        num=0
+        
 
         # iteratively load data into system memory
         for i, item in enumerate(json_data):
@@ -128,6 +131,7 @@ class R2RPanoBatch():
                 new_item = dict(item)
                 new_item['instr_id'] = '%s_%d' % (item['path_id'], j)
                 new_item['instructions'] = instr
+                
                 # new_item['instr_encoding'] = []
                 # if configuration:
                 #     new_item['configurations'] = get_configurations(instr)
@@ -141,24 +145,30 @@ class R2RPanoBatch():
                 #         new_item['instr_encoding'] = item['instr_encoding']
                 if configuration:
                     new_item['configurations'] = get_configurations(instr)
+
                     self.data.append((len(new_item['configurations']), new_item))
                     # self.write_config(splits, new_item)
                     #new_item['configurations'] = self.gold_config[new_item['instr_id']]
                     
                     # to get landmark and motion_indicator feature
+                    
                     '''
                     for config_id, each_config in enumerate(new_item['configurations']):
-                        #if each_config == None:
-                            #self.landmark_noun[new_item['instr_id']+"_"+ str(config_id)] = np.zeros(300)
+                        
+                        
+                        if each_config == None:
+                        
+                            self.landmark[new_item['instr_id']+"_"+ str(config_id)] = [("",np.zeros(300))]
                             #self.motion_indicator[new_item['instr_id']+"_"+ str(config_id)] = np.zeros(300)
-                        # if get_noun_chunks(each_config) is None:
-                        #     self.landmark_noun[new_item['instr_id']+"_"+ str(config_id)] = np.zeros(300) 
-                        if get_motion_indicators(each_config) == None:
-                            print("quan") 
-                        #else:
+                            #self.motion_indicator[str(item['path_id'])+"_"+ str(config_id)] = np.zeros(300)
+                        else:
+                            self.landmark[new_item['instr_id']+"_"+ str(config_id)] = get_landmark(each_config)
                             #self.landmark_noun[new_item['instr_id']+"_"+ str(config_id)] = get_noun_chunks(each_config)[1]
+                            #self.motion_indicator[str(item['path_id'])+"_"+ str(config_id)] = get_motion_indicators(each_config)[1]
                             #self.motion_indicator[new_item['instr_id']+"_"+ str(config_id)] = get_motion_indicators(each_config)[1]
                     '''
+                    
+                     
                     
                 else:
                     self.data.append(new_item)
@@ -173,7 +183,18 @@ class R2RPanoBatch():
             print_progress(i + 1, total_length, prefix='Progress:',
                                suffix='Complete', bar_length=50)
         
-        #self.write_npy(splits)
+        '''
+        if splits==['test']:
+            self.write_npy(splits)
+        '''
+        '''
+        with open(f'tasks/R2R-pano/data/data/component_data/motion_indicator/motion_feature/motion_{splits[0]}_dictionary.txt','w') as f_json:
+            #json.dump(self.motion_indicator_dictionary,f_json, indent=4)
+            for each_motion in self.motion_indicator_dictionary:
+                f_json.write(each_motion)
+                f_json.write('\n')
+        '''
+
  
         if configuration:
             self.data.sort(key=lambda x: x[0])
@@ -200,7 +221,8 @@ class R2RPanoBatch():
             f_out.write('\n\n')
     
     def write_npy(self, split):
-        np.save(f"tasks/R2R-pano/data/data/component_data/landmarks/new_landmarks_feature/new1_landmark_{split[0]}.npy", self.landmark_noun)
+        np.save(f"tasks/R2R-pano/data/data/component_data/landmarks/synthetic/landmark_{split[0]}.npy", self.landmark)
+        #np.save(f"tasks/R2R-pano/data/data/component_data/motion_indicator/synthetic/motion_{split[0]}.npy", self.motion_indicator)
     
     def load_gold_config(self, gold_file):
         with open(gold_file) as f_config:
@@ -296,6 +318,7 @@ class R2RPanoBatch():
         navigable[state.location.viewpointId] = {
             'position': state.location.point,
             'heading': state.heading,
+            'elevation':state.elevation,
             'rel_heading': state.location.rel_heading,
             'rel_elevation': state.location.rel_elevation,
             'index': state.viewIndex
@@ -328,13 +351,13 @@ class R2RPanoBatch():
             # elevation level -> 0 (bottom), 1 (middle), 2 (top)
             elevation_level = round(rel_elevation / (30 * math.pi / 180)) + 1
             # To prevent if elevation degree > 45 or < -45
+
             elevation_level = max(min(2, elevation_level), 0)
 
             # viewpoint index depends on the elevation as well
             horizontal_idx = int(round(target_heading / (math.pi / 6.0)))
             horizontal_idx = 0 if horizontal_idx == 12 else horizontal_idx
             viewpoint_idx = int(horizontal_idx + 12 * elevation_level)
-
             dict_tmp['index'] = viewpoint_idx
 
             # let us get the ground-truth viewpoint index for seq2seq training
@@ -438,7 +461,7 @@ class R2RPanoBatch():
                 'step': state.step,
                 'navigableLocations': navigable,
                 'instructions': item['instructions'],
-                'configurations': item['configurations'],
+                #'configurations': item['configurations'],
                 'teacher': item['path'],
                 'new_teacher': self.paths[state.scanId][state.location.viewpointId][item['path'][-1]],
                 'gt_viewpoint_idx': gt_viewpoint_idx
